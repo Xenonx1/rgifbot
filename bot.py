@@ -32,8 +32,8 @@ if not BOT_TOKEN:
 if not WEBHOOK_SECRET:
     raise RuntimeError("Missing WEBHOOK_SECRET environment variable.")
 
-redgifs = RedGifsAPI()
-redgifs_lock = asyncio.Lock()
+redgifs = None
+redgifs_lock = None
 redgifs_logged_in = False
 
 REDGIFS_LINK_RE = re.compile(
@@ -42,11 +42,19 @@ REDGIFS_LINK_RE = re.compile(
 )
 
 async def get_redgifs():
-    global redgifs_logged_in
+    global redgifs, redgifs_lock, redgifs_logged_in
+
+    if redgifs_lock is None:
+        redgifs_lock = asyncio.Lock()
+
     async with redgifs_lock:
+        if redgifs is None:
+            redgifs = RedGifsAPI()
+
         if not redgifs_logged_in:
             await redgifs.login()
             redgifs_logged_in = True
+
     return redgifs
 
 def age_keyboard():
