@@ -1,11 +1,16 @@
 import asyncio
 import hashlib
+from io import BytesIO
 import logging
 import os
 import re
 import tempfile
 import time
 from pathlib import Path
+from urllib.parse import urlparse
+
+import httpx
+from PIL import Image
 
 from redgifs.aio import API as RedGifsAPI
 from telegram import (
@@ -38,6 +43,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "redgifs-hook").strip("/")
 PORT = int(os.getenv("PORT", "10000"))
+ADULTEMBED_API = "https://adultembed.com/api/database/browse/"
+ADULTEMBED_PLAYER = "https://adultembed.com/player/embed/{}/"
 
 MAX_UPLOAD_BYTES = 49 * 1024 * 1024
 # Smaller first pages reduce the wait before Telegram can show results.
@@ -156,8 +163,8 @@ async def require_age(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
     message = update.effective_message
     if message:
         await message.reply_text(
-            "This bot may return mature RedGIFs content. You must be 18 or older "
-            "and comply with the laws and RedGIFs terms that apply to you. "
+            "This bot may return mature video content. You must be 18 or older "
+            "and comply with applicable laws and each source's terms. "
             "Confirm below to continue.",
             reply_markup=age_keyboard(),
         )
@@ -166,13 +173,14 @@ async def require_age(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
-        "Welcome to the RedGIFs bot.\n\n"
+        "Welcome to the video search bot.\n\n"
+        "• Choose source: /source\n"
         "• Search: /search cats\n"
         "• Inline search: @YourBotUsername cats\n"
         "• Download: send a RedGIFs watch/ifr link\n"
         "• Help: /help\n\n"
-        "This bot only handles publicly accessible RedGIFs media. "
-        "It does not bypass access controls or age restrictions. "
+        "RedGIFs videos can be sent into Telegram; AdultEmbed results open in an external player. "
+        "This bot does not bypass access controls or age restrictions. "
         "18+ only.",
         reply_markup=age_keyboard(),
     )
@@ -184,11 +192,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.effective_message.reply_text(
         "Commands:\n"
-        "/search keyword — search RedGIFs\n"
-        "Inline: @YourBotUsername keyword\n"
+        "/source — choose RedGIFs or AdultEmbed\n"
+        "/search keyword — search the selected source\n"
+        "Inline: @YourBotUsername keyword (RedGIFs)\n"
         "/help — show this help\n\n"
         "To download, send a link such as:\n"
         "https://www.redgifs.com/watch/VIDEOID\n\n"
+        "AdultEmbed results show a thumbnail and a Watch button that opens its player.\n\n"
         "Use /search in a group. To let the bot detect ordinary links in groups, "
         "disable Group Privacy for the bot in @BotFather and re-add the bot."
     )
@@ -262,6 +272,114 @@ async def show_search_page(
         await update.effective_message.reply_text(body, reply_markup=keyboard)
 
 
+def source_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("RedGIFs · Telegram downloads", callback_data="source:redgifs")],
+        [InlineKeyboardButton("AdultEmbed · external player", callback_data="source:adultembed")],
+    ])
+
+
+async def source_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_age(update, context):
+        return
+    choice = " ".join(context.args).strip().lower()
+    if choice in {"redgifs", "adultembed"}:
+        context.user_data["search_source"] = choice
+        label = "RedGIFs (video downloads and inline search)" if choice == "redgifs" else "AdultEmbed (thumbnails and external player)"
+        await update.effective_message.reply_text(f"Search source set to {label}. Use /search keywords.")
+        return
+    current = context.user_data.get("search_source", "redgifs")
+    await update.effective_message.reply_text(
+        f"Current source: {current}. Choose a search source:",
+        reply_markup=source_keyboard(),
+    )
+
+
+async def search_adultembed(query: str, page: int):
+    """Search AdultEmbed's documented public browse endpoint."""
+    params = {"search": query, "page": page, "page_size": RESULTS_PER_PAGE, "orientation": "all"}
+    timeout = httpx.Timeout(15.0, connect=7.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        response = await client.get(ADULTEMBED_API, params=params)
+        response.raise_for_status()
+        payload = response.json()
+    if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
+        raise RuntimeError("AdultEmbed returned an unexpected response format.")
+    return payload
+
+
+def safe_adultembed_thumbnail(url):
+    if not isinstance(url, str):
+        return None
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or not (host == "adultembed.com" or host.endswith(".adultembed.com")):
+        return None
+    return url
+
+
+async def fetch_adultembed_thumbnail(url):
+    """Fetch a trusted AdultEmbed WebP thumbnail and convert it to Telegram JPEG."""
+    timeout = httpx.Timeout(12.0, connect=6.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        response = await client.get(url)
+        response.raise_for_status()
+    if len(response.content) > 5 * 1024 * 1024:
+        raise RuntimeError("Thumbnail is unexpectedly large.")
+    with Image.open(BytesIO(response.content)) as image:
+        image = image.convert("RGB")
+        image.thumbnail((1280, 1280))
+        output = BytesIO()
+        image.save(output, format="JPEG", quality=88, optimize=True)
+        output.seek(0)
+        return output
+
+
+async def show_adultembed_page(query: str, page: int, chat, context):
+    payload = await search_adultembed(query, page)
+    results = payload.get("results", [])[:RESULTS_PER_PAGE]
+    if not results:
+        await chat.send_message(f"No AdultEmbed results found for: {query}")
+        return
+
+    context.user_data["search_query"] = query
+    context.user_data["search_page"] = page
+    context.user_data["search_source"] = "adultembed"
+
+    sent = 0
+    for item in results:
+        video_id = item.get("id")
+        title = str(item.get("title") or "Untitled video").strip()
+        duration = str(item.get("duration") or "Duration unavailable").strip()
+        if not isinstance(video_id, (int, str)) or not str(video_id).isdigit():
+            continue
+        player_url = ADULTEMBED_PLAYER.format(video_id)
+        thumbnail = safe_adultembed_thumbnail(item.get("thumbnail"))
+        caption = f"{title[:700]}\nDuration: {duration}\nAdultEmbed"
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("▶ Watch video", url=player_url)]])
+        try:
+            if thumbnail:
+                photo = await fetch_adultembed_thumbnail(thumbnail)
+                await chat.send_photo(photo=InputFile(photo, filename="adultembed-thumb.jpg"), caption=caption[:1024], reply_markup=keyboard)
+            else:
+                await chat.send_message(f"{caption}\n{player_url}", reply_markup=keyboard)
+            sent += 1
+        except Exception:
+            log.exception("Could not send AdultEmbed thumbnail; sending text fallback")
+            await chat.send_message(f"{caption}\n{player_url}", reply_markup=keyboard)
+            sent += 1
+
+    has_next = bool(payload.get("next"))
+    has_previous = bool(payload.get("previous")) or page > 1
+    nav = []
+    if has_previous:
+        nav.append(InlineKeyboardButton("◀ Previous", callback_data=f"ae_page:{page-1}"))
+    if has_next:
+        nav.append(InlineKeyboardButton("Next ▶", callback_data=f"ae_page:{page+1}"))
+    text = f"AdultEmbed search: {query} · Page {page} · {sent} results\nChoose Watch to open the external player."
+    await chat.send_message(text, reply_markup=InlineKeyboardMarkup([nav]) if nav else None)
+
+
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_age(update, context):
         return
@@ -276,13 +394,20 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    status = await update.effective_message.reply_text("Searching RedGIFs…")
+    source = context.user_data.get("search_source", "redgifs")
+    status = await update.effective_message.reply_text(
+        "Searching AdultEmbed…" if source == "adultembed" else "Searching RedGIFs…"
+    )
     try:
-        await show_search_page(query, 1, update, context, edit_message=status)
+        if source == "adultembed":
+            await show_adultembed_page(query, 1, update.effective_chat, context)
+            await status.delete()
+        else:
+            await show_search_page(query, 1, update, context, edit_message=status)
     except Exception:
-        log.exception("Search failed")
+        log.exception("Search failed (source=%s)", source)
         await status.edit_text(
-            "Search failed. RedGIFs may be temporarily unavailable; try again later."
+            f"Search failed. {source} may be temporarily unavailable; please try again later."
         )
 
 
@@ -488,6 +613,28 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if data.startswith("source:"):
+        selected = data.split(":", 1)[1]
+        if selected not in {"redgifs", "adultembed"}:
+            return
+        context.user_data["search_source"] = selected
+        label = "RedGIFs (Telegram downloads + inline search)" if selected == "redgifs" else "AdultEmbed (thumbnails + external player)"
+        await query.edit_message_text(f"Search source set to {label}. Use /search keywords.")
+        return
+
+    if data.startswith("ae_page:"):
+        try:
+            page = max(1, int(data.split(":", 1)[1]))
+            search_query = context.user_data.get("search_query")
+            if not search_query:
+                await query.edit_message_text("Please start a new search with /search keywords.")
+                return
+            await show_adultembed_page(search_query, page, query.message.chat, context)
+        except Exception:
+            log.exception("AdultEmbed pagination failed")
+            await query.message.reply_text("Couldn't load that AdultEmbed page. Please try /search again.")
+        return
+
     if data.startswith("page:"):
         try:
             page = int(data.split(":", 1)[1])
@@ -559,6 +706,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("search", search_command))
+    app.add_handler(CommandHandler("source", source_command))
     app.add_handler(InlineQueryHandler(inline_search))
     app.add_handler(CallbackQueryHandler(callbacks))
     app.add_handler(
