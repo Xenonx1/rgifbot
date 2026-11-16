@@ -30,6 +30,7 @@ from telegram.ext import (
     ContextTypes,
     InlineQueryHandler,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
@@ -696,12 +697,43 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
+async def log_incoming_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Log delivery without logging message text, links, or other private content."""
+    user = update.effective_user
+    chat = update.effective_chat
+    update_kind = (
+        "message" if update.message else
+        "callback_query" if update.callback_query else
+        "inline_query" if update.inline_query else
+        "other"
+    )
+    log.info(
+        "Incoming Telegram update id=%s type=%s user_id=%s chat_id=%s",
+        update.update_id,
+        update_kind,
+        user.id if user else None,
+        chat.id if chat else None,
+    )
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    log.error("Unhandled Telegram error: %s", context.error)
+    log.exception("Unhandled Telegram update error", exc_info=context.error)
 
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    # Multiple updates can be processed at once. Without this, a slow video
+    # download/upload can hold up /start, /help, searches, and button presses.
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(8)
+        .connection_pool_size(20)
+        .pool_timeout(30)
+        .build()
+    )
+
+    # Group -1 logs every incoming update before the command handlers run.
+    app.add_handler(TypeHandler(Update, log_incoming_update), group=-1)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))

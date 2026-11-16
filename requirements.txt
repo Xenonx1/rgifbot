@@ -1,4 +1,4 @@
-python-telegram-bot[webhooks]
-redgifs
-httpx
-Pillow
+python-telegram-bot[webhooks]==22.8
+redgifs==2.4.0
+httpx==0.28.1
+Pillow==13.0.0
