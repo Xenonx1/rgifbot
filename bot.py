@@ -40,7 +40,7 @@ PORT = int(os.getenv("PORT", "10000"))
 
 MAX_UPLOAD_BYTES = 49 * 1024 * 1024
 RESULTS_PER_PAGE = 8
-INLINE_RESULTS_PER_PAGE = 20
+INLINE_RESULTS_PER_PAGE = 8
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN environment variable.")
@@ -267,7 +267,7 @@ async def inline_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 continue
 
             # RedGIFs supplies MP4 media URLs and still-image thumbnail URLs.
-            media_url = getattr(urls, "hd", None) or getattr(urls, "sd", None)
+            media_url = getattr(urls, "sd", None) or getattr(urls, "hd", None)
             thumbnail_url = (
                 getattr(urls, "thumbnail", None)
                 or getattr(urls, "poster", None)
