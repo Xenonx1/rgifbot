@@ -5,7 +5,6 @@ import os
 import re
 import tempfile
 import time
-from collections import OrderedDict
 from pathlib import Path
 
 from redgifs.aio import API as RedGifsAPI
@@ -41,12 +40,17 @@ WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "redgifs-hook").strip("/")
 PORT = int(os.getenv("PORT", "10000"))
 
 MAX_UPLOAD_BYTES = 49 * 1024 * 1024
-RESULTS_PER_PAGE = 8
-INLINE_RESULTS_PER_PAGE = 8
-SEARCH_TIMEOUT_SECONDS = 15
-LOGIN_TIMEOUT_SECONDS = 20
+# Smaller first pages reduce the wait before Telegram can show results.
+RESULTS_PER_PAGE = 5
+INLINE_RESULTS_PER_PAGE = 5
+
+# In-memory cache: repeated searches are instant while this Render process stays up.
 SEARCH_CACHE_TTL_SECONDS = 180
-SEARCH_CACHE_MAX_ENTRIES = 128
+SEARCH_CACHE_MAX_ITEMS = 128
+SEARCH_TIMEOUT_SECONDS = 18
+_search_cache = {}
+_search_inflight = {}
+_search_cache_lock = None
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN environment variable.")
@@ -56,9 +60,6 @@ if not WEBHOOK_SECRET:
 redgifs = None
 redgifs_lock = None
 redgifs_logged_in = False
-search_cache = OrderedDict()
-search_inflight = {}
-search_cache_lock = None
 
 REDGIFS_LINK_RE = re.compile(
     r"https?://(?:www\.)?redgifs\.com/(?:watch|ifr)/([A-Za-z0-9_-]+)",
@@ -67,7 +68,6 @@ REDGIFS_LINK_RE = re.compile(
 
 
 async def get_redgifs():
-    """Create and log in to the RedGIFs client once, inside the running event loop."""
     global redgifs, redgifs_lock, redgifs_logged_in
 
     if redgifs_lock is None:
@@ -78,66 +78,69 @@ async def get_redgifs():
             redgifs = RedGifsAPI()
 
         if not redgifs_logged_in:
-            await asyncio.wait_for(
-                redgifs.login(), timeout=LOGIN_TIMEOUT_SECONDS
-            )
+            await redgifs.login()
             redgifs_logged_in = True
-            log.info("RedGIFs login completed")
 
     return redgifs
 
 
-async def _perform_redgifs_search(cache_key, query, count, page):
-    """Run one upstream search; identical simultaneous requests share this task."""
-    started = time.monotonic()
-    try:
-        api = await get_redgifs()
-        result = await asyncio.wait_for(
-            api.search(query, count=count, page=page),
-            timeout=SEARCH_TIMEOUT_SECONDS,
-        )
-        elapsed = time.monotonic() - started
-        log.info("RedGIFs search completed in %.2fs (page=%s, count=%s)", elapsed, page, count)
-
-        async with search_cache_lock:
-            search_cache[cache_key] = (time.monotonic(), result)
-            search_cache.move_to_end(cache_key)
-            while len(search_cache) > SEARCH_CACHE_MAX_ENTRIES:
-                search_cache.popitem(last=False)
-        return result
-    finally:
-        async with search_cache_lock:
-            search_inflight.pop(cache_key, None)
-
-
 async def search_redgifs(query: str, count: int, page: int):
-    """Use a short in-memory cache and coalesce identical concurrent searches."""
-    global search_cache_lock
-    if search_cache_lock is None:
-        search_cache_lock = asyncio.Lock()
+    """Cached, timeout-protected search shared by command and inline requests."""
+    global _search_cache_lock
+    if _search_cache_lock is None:
+        _search_cache_lock = asyncio.Lock()
 
-    clean_query = " ".join(query.split())
-    cache_key = (clean_query.casefold(), count, page)
+    key = (query.casefold().strip(), count, page)
+    now = time.monotonic()
 
-    async with search_cache_lock:
-        cached = search_cache.get(cache_key)
+    async with _search_cache_lock:
+        cached = _search_cache.get(key)
+        if cached and now - cached[0] < SEARCH_CACHE_TTL_SECONDS:
+            log.info("Search cache hit: page=%s count=%s", page, count)
+            return cached[1]
         if cached:
-            cached_at, result = cached
-            if time.monotonic() - cached_at <= SEARCH_CACHE_TTL_SECONDS:
-                search_cache.move_to_end(cache_key)
-                log.info("RedGIFs search cache hit (page=%s)", page)
-                return result
-            search_cache.pop(cache_key, None)
+            _search_cache.pop(key, None)
 
-        task = search_inflight.get(cache_key)
+        task = _search_inflight.get(key)
         if task is None:
-            task = asyncio.create_task(
-                _perform_redgifs_search(cache_key, clean_query, count, page)
-            )
-            search_inflight[cache_key] = task
+            task = asyncio.create_task(_perform_redgifs_search(query, count, page))
+            _search_inflight[key] = task
 
-    # Shield the shared upstream request if one Telegram query is cancelled.
-    return await asyncio.shield(task)
+    try:
+        # Shield shared work so one impatient caller cannot cancel everyone else's search.
+        result = await asyncio.wait_for(
+            asyncio.shield(task), timeout=SEARCH_TIMEOUT_SECONDS
+        )
+    except Exception:
+        async with _search_cache_lock:
+            if _search_inflight.get(key) is task:
+                _search_inflight.pop(key, None)
+        raise
+
+    async with _search_cache_lock:
+        _search_cache[key] = (time.monotonic(), result)
+        while len(_search_cache) > SEARCH_CACHE_MAX_ITEMS:
+            oldest_key = min(_search_cache, key=lambda k: _search_cache[k][0])
+            _search_cache.pop(oldest_key, None)
+        if _search_inflight.get(key) is task:
+            _search_inflight.pop(key, None)
+    return result
+
+
+async def _perform_redgifs_search(query: str, count: int, page: int):
+    started = time.perf_counter()
+    api = await get_redgifs()
+    result = await asyncio.wait_for(
+        api.search(query, count=count, page=page),
+        timeout=SEARCH_TIMEOUT_SECONDS,
+    )
+    log.info(
+        "RedGIFs search completed in %.2fs (page=%s, count=%s)",
+        time.perf_counter() - started,
+        page,
+        count,
+    )
+    return result
 
 
 def age_keyboard():
@@ -225,7 +228,6 @@ async def show_search_page(
     context: ContextTypes.DEFAULT_TYPE,
     edit_message=None,
 ):
-    api = await get_redgifs()
     result = await search_redgifs(query, count=RESULTS_PER_PAGE, page=page)
     gifs = result.gifs or []
     ids = [gif.id for gif in gifs if getattr(gif, "id", None)]
@@ -277,11 +279,6 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = await update.effective_message.reply_text("Searching RedGIFs…")
     try:
         await show_search_page(query, 1, update, context, edit_message=status)
-    except asyncio.TimeoutError:
-        log.warning("RedGIFs search timed out")
-        await status.edit_text(
-            "RedGIFs is taking too long to respond. Please try the search again."
-        )
     except Exception:
         log.exception("Search failed")
         await status.edit_text(
@@ -365,17 +362,11 @@ async def inline_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await inline_query.answer(
             inline_results,
-            cache_time=10,
+            cache_time=30,
             is_personal=True,
             next_offset=next_offset,
         )
 
-    except asyncio.TimeoutError:
-        log.warning("RedGIFs inline search timed out for query: %r", search_text)
-        try:
-            await inline_query.answer([], cache_time=1, is_personal=True)
-        except Exception:
-            log.exception("Could not answer timed-out inline search")
     except Exception:
         log.exception("Inline search failed")
         # Always answer the inline query so Telegram does not keep waiting.
