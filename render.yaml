@@ -1,14 +1,15 @@
 services:
   - type: web
-    name: redgifs-telegram-bot
+    name: telegram-gif-search-bot
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
+    startCommand: python main.py
+    healthCheckPath: /health
     envVars:
       - key: BOT_TOKEN
         sync: false
-      - key: WEBHOOK_SECRET
-        generateValue: true
-      - key: WEBHOOK_PATH
-        value: redgifs-hook
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: GOOGLE_CSE_ID
+        sync: false
