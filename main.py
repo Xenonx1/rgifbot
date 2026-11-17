@@ -5,7 +5,7 @@ import os
 import re
 import signal
 import time
-from collections import Counter
+from collections import Counter, deque
 from urllib.parse import quote
 
 import aiohttp
@@ -26,7 +26,7 @@ from telegram.ext import (
     InlineQueryHandler,
 )
 
-from gifreels import SITE, add_page, media_url, parse_listing, slugify
+from gifreels import SITE, media_url, parse_listing, slugify
 
 # --------------------------------------------------------------------------- #
 # Config
@@ -45,9 +45,10 @@ SEARCH_TEMPLATES = [
         f"{SITE}/search?q={{q}}",
     ) if t
 ]
-PAGE_PARAM = os.getenv("GIFREELS_PAGE_PARAM", "page")   # ?page=2 style paging
-MAX_PAGES_PER_REQUEST = 6
-MAX_PAGE = 30
+EXPAND_BATCH = 6                # GIF pages opened per growth step ("Related" lists)
+INLINE_CHUNK = 30               # results per inline batch (Telegram max 50)
+FEED_TTL = 1800
+FEED_MAX = 100
 
 SMALL_BYTES = 1024 * 1024        # Telegram's documented inline limit (1 MB)
 MAX_BYTES = int(float(os.getenv("MAX_GIF_MB", "5")) * 1024 * 1024)
@@ -58,8 +59,6 @@ VERIFY_TIMEOUT = 4
 PAGE_TIMEOUT = 8
 INLINE_BUDGET = 8.0
 SEARCH_BUDGET = 15.0
-INLINE_TARGET = 40
-SEARCH_TARGET = 40
 PAGE_SIZE = 10
 CACHE_TTL = 600
 CACHE_MAX = 200
@@ -82,10 +81,7 @@ logging.basicConfig(
 log = logging.getLogger("gifreels-bot")
 
 SITE_SEM = asyncio.Semaphore(4)
-PAGE_CACHE: dict[tuple[str, int], tuple[float, list[dict], bool]] = {}
-TEMPLATE_FOR: dict[str, str] = {}
-SEEN: dict[str, set] = {}
-INFLIGHT: dict[tuple[str, int], asyncio.Task] = {}
+FEEDS: dict[str, "Feed"] = {}
 BACKGROUND: set[asyncio.Task] = set()
 
 
@@ -113,47 +109,28 @@ async def fetch_listing(session: aiohttp.ClientSession, url: str, fails: Counter
         return None, type(exc).__name__
 
 
-async def fetch_page_candidates(
-    session: aiohttp.ClientSession,
-    query: str,
-    page: int,
-    fails: Counter,
-    stats: list | None,
-) -> list[dict]:
-    """Candidate GIFs (not yet verified) from one page of the site's listing."""
-    key = query.casefold()
+async def first_page(session, query: str, fails: Counter, stats: list | None) -> list[dict]:
+    """The site's own listing for the query (tag page / search page)."""
     slug = slugify(query)
-    templates = SEARCH_TEMPLATES
-    if page > 1 and key in TEMPLATE_FOR:
-        templates = [TEMPLATE_FOR[key]]
-
-    for template in templates:
-        base = template.replace("{slug}", slug).replace("{q}", quote(query))
-        url = base if page == 1 else add_page(base, page, PAGE_PARAM)
+    for template in SEARCH_TEMPLATES:
+        url = template.replace("{slug}", slug).replace("{q}", quote(query))
         html, status = await fetch_listing(session, url, fails)
-        entry = {"url": url, "status": status, "ids": 0, "new": 0}
+        items = parse_listing(html) if html else []
         if stats is not None:
-            stats.append(entry)
-        if not html:
-            continue
-
-        items = parse_listing(html)
-        entry["ids"] = len(items)
-        if not items:
-            continue
-
-        if page == 1:
-            TEMPLATE_FOR[key] = template
-            SEEN[key] = set()
-        seen = SEEN.setdefault(key, set())
-        new = [i for i in items if i["id"] not in seen]
-        entry["new"] = len(new)
-        seen.update(i["id"] for i in new)
-        return [
-            {"id": i["id"], "title": i["title"], "media_url": media_url(i["id"]), "order": n}
-            for n, i in enumerate(new)
-        ]
+            stats.append({"url": url, "status": status, "ids": len(items)})
+        if items:
+            return items
     return []
+
+
+async def related_of(session, gif_id: str, fails: Counter, stats: list | None) -> list[dict]:
+    """The 'Related' GIFs listed on a gif's own page (this is how we keep loading more)."""
+    url = f"{SITE}/gif/{gif_id}"
+    html, status = await fetch_listing(session, url, fails)
+    items = parse_listing(html) if html else []
+    if stats is not None:
+        stats.append({"url": url, "status": status, "ids": len(items)})
+    return items
 
 
 # --------------------------------------------------------------------------- #
@@ -226,61 +203,79 @@ async def verify_many(session, cands, deadline, target, fails) -> list[dict]:
     return found
 
 
-async def get_page(session, query: str, page: int, budget: float, stats: list | None = None):
-    """One site page -> (usable GIFs, has_more). Cached; concurrent identical calls share work."""
-    key = (query.casefold(), page)
-    hit = PAGE_CACHE.get(key)
-    if hit and time.monotonic() - hit[0] < CACHE_TTL and stats is None:
-        return hit[1], hit[2]
+class Feed:
+    """Everything found so far for one search word. Grows on demand = endless scrolling."""
 
-    async def work():
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + budget
-        fails: Counter = Counter()
-        cands = await fetch_page_candidates(session, query, page, fails, stats)
-        verified = await verify_many(session, cands, deadline, len(cands), fails)
-        verified.sort(key=lambda v: (v["rank"], v["order"]))
-        log.info("search %r page %d -> %d candidates, %d usable (%s)",
-                 query, page, len(cands), len(verified), dict(fails))
-        if stats is not None:
-            stats.append({"page": page, "candidates": len(cands), "usable": len(verified),
-                          "fails": dict(fails)})
-        return verified, bool(cands)
-
-    task = INFLIGHT.get(key)
-    if task is None:
-        task = asyncio.create_task(work())
-        INFLIGHT[key] = task
-        task.add_done_callback(lambda _t, k=key: INFLIGHT.pop(k, None))
-    verified, has_more = await asyncio.shield(task)
-
-    if has_more:
-        if len(PAGE_CACHE) >= CACHE_MAX:
-            PAGE_CACHE.pop(next(iter(PAGE_CACHE)))
-        PAGE_CACHE[key] = (time.monotonic(), verified, has_more)
-    return verified, has_more
+    def __init__(self) -> None:
+        self.items: list[dict] = []     # verified GIFs in display order
+        self.seen: set[str] = set()     # every GIF id discovered
+        self.queue: deque[str] = deque()  # GIF pages we can still open for 'Related'
+        self.started = False
+        self.exhausted = False
+        self.lock = asyncio.Lock()
+        self.created = time.monotonic()
 
 
-async def collect(session, query: str, start_page: int, target: int, budget: float,
-                  stats: list | None = None):
-    """Gather site pages until `target` usable GIFs. Returns (items, next_page, ended)."""
+async def grow(session, query: str, feed: Feed, deadline: float, fails: Counter, stats) -> None:
+    """One growth step: first the site listing, afterwards 'Related' lists of known GIFs."""
+    found: list[dict] = []
+
+    if not feed.started:
+        feed.started = True
+        for item in await first_page(session, query, fails, stats):
+            if item["id"] not in feed.seen:
+                feed.seen.add(item["id"])
+                found.append(item)
+    else:
+        batch = [feed.queue.popleft() for _ in range(min(EXPAND_BATCH, len(feed.queue)))]
+        for related in await asyncio.gather(*(related_of(session, g, fails, stats) for g in batch)):
+            for item in related:
+                if item["id"] not in feed.seen:
+                    feed.seen.add(item["id"])
+                    found.append(item)
+
+    cands = [
+        {"id": i["id"], "title": i["title"], "media_url": media_url(i["id"]), "order": n}
+        for n, i in enumerate(found)
+    ]
+    verified = await verify_many(session, cands, deadline, len(cands), fails)
+    verified.sort(key=lambda v: (v["rank"], v["order"]))
+    feed.items.extend(verified)
+    feed.queue.extend(c["id"] for c in cands)
+    if not feed.queue:
+        feed.exhausted = True
+
+
+def get_feed(query: str) -> Feed:
+    key = query.casefold()
+    feed = FEEDS.get(key)
+    if feed is None or time.monotonic() - feed.created > FEED_TTL:
+        if len(FEEDS) >= FEED_MAX:
+            FEEDS.pop(next(iter(FEEDS)))
+        feed = FEEDS[key] = Feed()
+    return feed
+
+
+async def get_range(session, query: str, start: int, count: int, budget: float, stats=None):
+    """Items [start, start+count) of the endless feed -> (chunk, next_start, finished)."""
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + budget
-    results: list[dict] = []
-    page = start_page
-    ended = False
+    feed = get_feed(query)
+    fails: Counter = Counter()
 
-    while len(results) < target and page < start_page + MAX_PAGES_PER_REQUEST and page <= MAX_PAGE:
-        remaining = deadline - loop.time()
-        if remaining < 2.0:
-            break
-        items, has_more = await get_page(session, query, page, remaining, stats)
-        results.extend(items)
-        page += 1
-        if not has_more:
-            ended = True
-            break
-    return results[:50], page, ended or page > MAX_PAGE
+    async with feed.lock:
+        deadline = loop.time() + budget
+        while len(feed.items) < start + count and not feed.exhausted:
+            if deadline - loop.time() < 2.0:
+                break
+            await grow(session, query, feed, deadline, fails, stats)
+
+    chunk = feed.items[start:start + count]
+    finished = feed.exhausted and start + count >= len(feed.items)
+    log.info("feed %r: %d loaded, served %d-%d, exhausted=%s, failures=%s",
+             query, len(feed.items), start, start + len(chunk), feed.exhausted, dict(fails))
+    if stats is not None:
+        stats.append({"loaded": len(feed.items), "exhausted": feed.exhausted, "fails": dict(fails)})
+    return chunk, start + len(chunk), finished
 
 
 # --------------------------------------------------------------------------- #
@@ -303,17 +298,8 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     status = await update.effective_message.reply_text("Searching gifreels.com…")
-    session = context.application.bot_data["http"]
-    results, _, _ = await collect(session, query, 1, SEARCH_TARGET, SEARCH_BUDGET)
-    context.user_data["results"] = {"query": query, "items": results}
-
-    if not results:
-        await status.edit_text(
-            f"No GIFs found for “{query}”. Try a simpler keyword (e.g. a tag like “latina”).\n"
-            f"Admin: /debug {query}"
-        )
-        return
-    await show_page(status, context, 0)
+    context.user_data["results"] = {"query": query}
+    await show_page(status, context, 0, first=True)
 
 
 async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -325,47 +311,52 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     status = await update.effective_message.reply_text("Running diagnostics…")
     session = context.application.bot_data["http"]
     stats: list = []
-    results, next_page, ended = await collect(
-        session, query, 1, SEARCH_TARGET, SEARCH_BUDGET, stats
-    )
+    chunk, _, finished = await get_range(session, query, 0, 40, SEARCH_BUDGET, stats)
 
-    lines = [f"Query: {query}", f"Usable GIFs: {len(results)} (more pages: {'no' if ended else 'yes'})"]
-    for entry in stats:
+    lines = [f"Query: {query}", f"Returned: {len(chunk)} (feed finished: {'yes' if finished else 'no'})"]
+    for entry in stats[:14]:
         if "fails" in entry:
             lines.append(
-                f"Page {entry['page']}: candidates {entry['candidates']}, usable {entry['usable']}, "
-                f"failures {entry['fails'] or 'none'}"
+                f"Loaded in total: {entry['loaded']}, exhausted: {entry['exhausted']}, "
+                f"failures: {entry['fails'] or 'none'}"
             )
         else:
-            lines.append(
-                f"GET {entry['url']} -> {entry['status']}, gif links {entry['ids']}, new {entry['new']}"
-            )
-    if results:
-        lines.append(f"First: {results[0]['media_url']} ({results[0].get('size')} bytes)")
+            lines.append(f"GET {entry['url']} -> {entry['status']}, gif links {entry['ids']}")
+    if chunk:
+        lines.append(f"First: {chunk[0]['media_url']} ({chunk[0].get('size')} bytes)")
     await status.edit_text("\n".join(lines)[:3900], disable_web_page_preview=True)
 
 
-async def show_page(message, context: ContextTypes.DEFAULT_TYPE, page: int) -> None:
+async def show_page(message, context: ContextTypes.DEFAULT_TYPE, page: int, first: bool = False) -> None:
     state = context.user_data.get("results", {})
-    items = state.get("items", [])
     query = state.get("query", "")
-    pages = max(1, (len(items) + PAGE_SIZE - 1) // PAGE_SIZE)
-    page = max(0, min(page, pages - 1))
+    session = context.application.bot_data["http"]
 
-    first = page * PAGE_SIZE
-    current = items[first:first + PAGE_SIZE]
+    start = page * PAGE_SIZE
+    chunk, _, finished = await get_range(session, query, start, PAGE_SIZE, SEARCH_BUDGET)
+
+    if not chunk:
+        text = (
+            f"No GIFs found for “{query}”. Try a simpler keyword (e.g. a tag like “latina”).\n"
+            f"Admin: /debug {query}"
+        ) if page == 0 else "No more results."
+        try:
+            await message.edit_text(text)
+        except TelegramError:
+            pass
+        return
+
     keyboard = [
         [InlineKeyboardButton(
-            f"{first + i + 1}. {(item.get('title') or 'GIF')[:35]}",
-            callback_data=f"send:{first + i}",
+            f"{start + i + 1}. {(item.get('title') or 'GIF')[:40]}",
+            callback_data=f"send:{start + i}",
         )]
-        for i, item in enumerate(current)
+        for i, item in enumerate(chunk)
     ]
-
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton("‹ Previous", callback_data=f"page:{page - 1}"))
-    if page + 1 < pages:
+    if not finished:
         nav.append(InlineKeyboardButton("Next ›", callback_data=f"page:{page + 1}"))
     if nav:
         keyboard.append(nav)
@@ -373,8 +364,7 @@ async def show_page(message, context: ContextTypes.DEFAULT_TYPE, page: int) -> N
     try:
         await message.edit_text(
             f"GifReels results for: {query}\n"
-            f"Showing {first + 1}–{first + len(current)} of {len(items)}.\n"
-            "Tap a result to send it.",
+            f"Page {page + 1} (results {start + 1}–{start + len(chunk)}). Tap a result to send it.",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
     except TelegramError as exc:
@@ -439,17 +429,17 @@ async def result_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if kind == "page":
-        await callback.answer()
-        await show_page(callback.message, context, number)
+        await callback.answer("Loading…")
+        await show_page(callback.message, context, max(0, number))
         return
 
     if kind == "send":
-        items = state.get("items", [])
-        if not 0 <= number < len(items):
-            await callback.answer("Result unavailable. Search again.", show_alert=True)
+        feed = FEEDS.get(state.get("query", "").casefold())
+        if not feed or not 0 <= number < len(feed.items):
+            await callback.answer("Result expired. Search again.", show_alert=True)
             return
         await callback.answer("Sending…")
-        if not await send_gif(context, update.effective_chat.id, items[number]):
+        if not await send_gif(context, update.effective_chat.id, feed.items[number]):
             await context.bot.send_message(
                 update.effective_chat.id, "Telegram could not load that GIF. Try another result."
             )
@@ -464,33 +454,28 @@ async def inline_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     try:
-        offset = max(1, int(inline_query.offset or 1))
+        start = max(0, int(inline_query.offset or 0))
     except ValueError:
-        offset = 1
+        start = 0
 
     session = context.application.bot_data["http"]
-    items, next_page, ended = await collect(session, query, offset, INLINE_TARGET, INLINE_BUDGET)
+    items, next_start, finished = await get_range(session, query, start, INLINE_CHUNK, INLINE_BUDGET)
 
-    results = []
-    used = set()
-    for item in items:
-        if item["id"] in used:
-            continue
-        used.add(item["id"])
-        results.append(
-            InlineQueryResultMpeg4Gif(
-                id=item["id"][:64],
-                mpeg4_url=item["media_url"],
-                # The MP4 doubles as its own animated preview (Telegram accepts video/mp4 thumbnails).
-                thumbnail_url=item["media_url"],
-                thumbnail_mime_type="video/mp4",
-                title=(item.get("title") or "GIF")[:60],
-            )
+    results = [
+        InlineQueryResultMpeg4Gif(
+            id=item["id"][:64],
+            mpeg4_url=item["media_url"],
+            # The MP4 doubles as its own animated preview (Telegram accepts video/mp4 thumbnails).
+            thumbnail_url=item["media_url"],
+            thumbnail_mime_type="video/mp4",
+            title=(item.get("title") or "GIF")[:60],
         )
+        for item in items
+    ]
 
-    # next_offset makes Telegram ask for the next batch when the user scrolls to the bottom.
-    next_offset = "" if (ended or not results) else str(next_page)
-    await safe_answer(inline_query, results, cache_time=60 if results else 3, next_offset=next_offset)
+    # next_offset makes Telegram request the next batch when the user scrolls to the bottom.
+    next_offset = "" if (finished or not results) else str(next_start)
+    await safe_answer(inline_query, results, cache_time=30 if results else 3, next_offset=next_offset)
 
 
 async def safe_answer(inline_query, results, cache_time: int, next_offset: str = "") -> None:

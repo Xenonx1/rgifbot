@@ -18,7 +18,9 @@ RENDER
   .python-version), push, then Manual Deploy > Clear build cache & deploy.
 - BotFather: /setinline must be enabled.
 
-ENDLESS SCROLL (inline)
-Each inline answer loads several site pages (?page=2, 3, ...) and tells Telegram where to continue
-(next_offset), so more GIFs load as you scroll. If the site uses a different paging parameter, set
-GIFREELS_PAGE_PARAM (default "page"). /debug <words> shows how many gif links each page returned.
+ENDLESS SCROLL
+The site only shows 8 GIFs per tag page, so the bot keeps loading more by opening the "Related" list of
+GIFs it already found (same topic), 6 GIF pages at a time.
+- Inline: 30 GIFs per batch; Telegram asks for the next batch when you scroll to the bottom.
+- /search: 10 per page; "Next" loads more until the related chain runs out.
+/debug <words> shows each page opened, how many GIF links it had, and why any were dropped.
