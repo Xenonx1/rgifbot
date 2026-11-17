@@ -1,751 +1,141 @@
 import asyncio
-import hashlib
 import logging
-import os
-import re
-import tempfile
-import time
-from pathlib import Path
-from urllib.parse import urlparse
-
+import uuid
 import httpx
-from ddgs import DDGS
+from telegram import Update, InlineQueryResultGif
+from telegram.ext import Application, InlineQueryHandler, ContextTypes
+from duckduckgo_search import DDGS
 
-
-from redgifs.aio import API as RedGifsAPI
-from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    InlineQueryResultArticle,
-    InlineQueryResultMpeg4Gif,
-    InputFile,
-    InputTextMessageContent,
-    Update,
-)
-from telegram.constants import ChatAction
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    InlineQueryHandler,
-    MessageHandler,
-    TypeHandler,
-    filters,
-)
+# Configuration - Replace with your actual credentials
+TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+GOOGLE_API_KEY = "YOUR_GOOGLE_API_KEY"
+GOOGLE_CSE_ID = "YOUR_GOOGLE_CSE_ID"
 
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
-log = logging.getLogger("redgifs-bot")
-
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "redgifs-hook").strip("/")
-PORT = int(os.getenv("PORT", "10000"))
-
-MAX_UPLOAD_BYTES = 49 * 1024 * 1024
-MAX_GIF_BYTES = 15 * 1024 * 1024
-DDG_RESULTS_PER_SEARCH = 5
-# Smaller first pages reduce the wait before Telegram can show results.
-RESULTS_PER_PAGE = 5
-INLINE_RESULTS_PER_PAGE = 5
-
-# In-memory cache: repeated searches are instant while this Render process stays up.
-SEARCH_CACHE_TTL_SECONDS = 180
-SEARCH_CACHE_MAX_ITEMS = 128
-SEARCH_TIMEOUT_SECONDS = 18
-_search_cache = {}
-_search_inflight = {}
-_search_cache_lock = None
-
-if not BOT_TOKEN:
-    raise RuntimeError("Missing BOT_TOKEN environment variable.")
-if not WEBHOOK_SECRET:
-    raise RuntimeError("Missing WEBHOOK_SECRET environment variable.")
-
-redgifs = None
-redgifs_lock = None
-redgifs_logged_in = False
-
-REDGIFS_LINK_RE = re.compile(
-    r"https?://(?:www\.)?redgifs\.com/(?:watch|ifr)/([A-Za-z0-9_-]+)",
-    re.IGNORECASE,
-)
+logger = logging.getLogger(__name__)
 
 
-async def get_redgifs():
-    global redgifs, redgifs_lock, redgifs_logged_in
-
-    if redgifs_lock is None:
-        redgifs_lock = asyncio.Lock()
-
-    async with redgifs_lock:
-        if redgifs is None:
-            redgifs = RedGifsAPI()
-
-        if not redgifs_logged_in:
-            await redgifs.login()
-            redgifs_logged_in = True
-
-    return redgifs
-
-
-async def search_redgifs(query: str, count: int, page: int):
-    """Cached, timeout-protected search shared by command and inline requests."""
-    global _search_cache_lock
-    if _search_cache_lock is None:
-        _search_cache_lock = asyncio.Lock()
-
-    key = (query.casefold().strip(), count, page)
-    now = time.monotonic()
-
-    async with _search_cache_lock:
-        cached = _search_cache.get(key)
-        if cached and now - cached[0] < SEARCH_CACHE_TTL_SECONDS:
-            log.info("Search cache hit: page=%s count=%s", page, count)
-            return cached[1]
-        if cached:
-            _search_cache.pop(key, None)
-
-        task = _search_inflight.get(key)
-        if task is None:
-            task = asyncio.create_task(_perform_redgifs_search(query, count, page))
-            _search_inflight[key] = task
-
+def search_ddg_gifs(query: str, max_results: int = 25) -> list[dict]:
+    """Fetches GIFs from DuckDuckGo with SafeSearch turned off."""
+    results = []
     try:
-        # Shield shared work so one impatient caller cannot cancel everyone else's search.
-        result = await asyncio.wait_for(
-            asyncio.shield(task), timeout=SEARCH_TIMEOUT_SECONDS
-        )
-    except Exception:
-        async with _search_cache_lock:
-            if _search_inflight.get(key) is task:
-                _search_inflight.pop(key, None)
-        raise
-
-    async with _search_cache_lock:
-        _search_cache[key] = (time.monotonic(), result)
-        while len(_search_cache) > SEARCH_CACHE_MAX_ITEMS:
-            oldest_key = min(_search_cache, key=lambda k: _search_cache[k][0])
-            _search_cache.pop(oldest_key, None)
-        if _search_inflight.get(key) is task:
-            _search_inflight.pop(key, None)
-    return result
-
-
-async def _perform_redgifs_search(query: str, count: int, page: int):
-    started = time.perf_counter()
-    api = await get_redgifs()
-    result = await asyncio.wait_for(
-        api.search(query, count=count, page=page),
-        timeout=SEARCH_TIMEOUT_SECONDS,
-    )
-    log.info(
-        "RedGIFs search completed in %.2fs (page=%s, count=%s)",
-        time.perf_counter() - started,
-        page,
-        count,
-    )
-    return result
-
-
-def age_keyboard():
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("I am 18 or older", callback_data="age:yes")]]
-    )
-
-
-async def require_age(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    if context.user_data.get("age_ok"):
-        return True
-
-    message = update.effective_message
-    if message:
-        await message.reply_text(
-            "This bot may return mature video content. You must be 18 or older "
-            "and comply with applicable laws and each source's terms. "
-            "Confirm below to continue.",
-            reply_markup=age_keyboard(),
-        )
-    return False
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "Welcome to the video search bot.\n\n"
-        "• Choose source: /source\n"
-        "• Search: /search cats\n"
-        "• Inline search: @YourBotUsername cats\n"
-        "• Download: send a RedGIFs watch/ifr link\n"
-        "• Help: /help\n\n"
-        "Sources: RedGIFs video search and DuckDuckGo animated-GIF image search. "
-        "This bot does not bypass access controls or age restrictions. "
-        "18+ only.",
-        reply_markup=age_keyboard(),
-    )
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_age(update, context):
-        return
-
-    await update.effective_message.reply_text(
-        "Commands:\n"
-        "/source — choose RedGIFs or DuckDuckGo GIFs\n"
-        "/search keyword — search the selected source\n"
-        "Inline: @YourBotUsername keyword (RedGIFs)\n"
-        "/help — show this help\n\n"
-        "To download, send a link such as:\n"
-        "https://www.redgifs.com/watch/VIDEOID\n\n"
-        "Use /search in a group. To let the bot detect ordinary links in groups, "
-        "DuckDuckGo searches animated GIFs with Safe Search Off and sends valid GIF files.\n\n"
-        "Use /search in a group. To let the bot detect ordinary links in groups, "
-        "disable Group Privacy for the bot in @BotFather and re-add the bot."
-    )
-
-
-def result_keyboard(ids, page, has_previous, has_next):
-    rows = []
-    for i, gif_id in enumerate(ids):
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    f"▶ Result {i + 1} · {gif_id[:22]}",
-                    callback_data=f"pick:{i}",
-                )
-            ]
-        )
-
-    nav = []
-    if has_previous:
-        nav.append(
-            InlineKeyboardButton("◀ Previous", callback_data=f"page:{page-1}")
-        )
-    if has_next:
-        nav.append(
-            InlineKeyboardButton("Next ▶", callback_data=f"page:{page+1}")
-        )
-    if nav:
-        rows.append(nav)
-
-    return InlineKeyboardMarkup(rows)
-
-
-async def show_search_page(
-    query: str,
-    page: int,
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    edit_message=None,
-):
-    result = await search_redgifs(query, count=RESULTS_PER_PAGE, page=page)
-    gifs = result.gifs or []
-    ids = [gif.id for gif in gifs if getattr(gif, "id", None)]
-
-    context.user_data["search_query"] = query
-    context.user_data["search_page"] = page
-    context.user_data["search_ids"] = ids
-
-    if not ids:
-        body = f"No video results found for: {query}"
-        if edit_message:
-            await edit_message.edit_text(body)
-        else:
-            await update.effective_message.reply_text(body)
-        return
-
-    body = (
-        f"RedGIFs search: {query}\n"
-        f"Page {page} · showing {len(ids)} results\n\n"
-        "Choose a result below to send the video into this chat."
-    )
-    keyboard = result_keyboard(
-        ids,
-        page,
-        page > 1,
-        page < (getattr(result, "pages", page) or page),
-    )
-
-    if edit_message:
-        await edit_message.edit_text(body, reply_markup=keyboard)
-    else:
-        await update.effective_message.reply_text(body, reply_markup=keyboard)
-
-
-def source_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("RedGIFs · video search + downloads", callback_data="source:redgifs")],
-        [InlineKeyboardButton("DuckDuckGo · animated GIFs", callback_data="source:duckduckgo")],
-    ])
-
-
-async def source_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_age(update, context):
-        return
-    choice = " ".join(context.args).strip().lower()
-    aliases = {"ddg": "duckduckgo", "duckduckgo": "duckduckgo", "redgifs": "redgifs"}
-    if choice in aliases:
-        choice = aliases[choice]
-        context.user_data["search_source"] = choice
-        label = "DuckDuckGo animated GIFs" if choice == "duckduckgo" else "RedGIFs videos"
-        await update.effective_message.reply_text(f"Search source set to {label}. Use /search keywords.")
-        return
-    current = context.user_data.get("search_source", "redgifs")
-    await update.effective_message.reply_text(
-        f"Current source: {current}. Choose a source:", reply_markup=source_keyboard()
-    )
-
-
-async def search_duckduckgo_gifs(query: str, page: int = 1):
-    """Search DDG's animated-image filter with Safe Search explicitly off."""
-    def do_search():
-        with DDGS(timeout=12) as ddgs:
-            return list(ddgs.images(
-                query=query,
+        with DDGS() as ddgs:
+            ddg_gen = ddgs.images(
+                keywords=query,
                 region="wt-wt",
                 safesearch="off",
                 type_image="gif",
-                max_results=DDG_RESULTS_PER_SEARCH,
-                page=page,
-                backend="duckduckgo",
-            ))
-    return await asyncio.wait_for(asyncio.to_thread(do_search), timeout=18)
-
-
-async def download_verified_gif(url: str) -> bytes:
-    parsed = urlparse(url)
-    if parsed.scheme != "https" or not parsed.hostname:
-        raise ValueError("GIF result did not use a secure HTTPS URL")
-    timeout = httpx.Timeout(12.0, connect=5.0)
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        async with client.stream("GET", url, headers={"User-Agent": "Mozilla/5.0 RetrixBot/1.0"}) as response:
-            response.raise_for_status()
-            final = urlparse(str(response.url))
-            if final.scheme != "https" or not final.hostname:
-                raise ValueError("GIF download redirected to an invalid URL")
-            content_type = response.headers.get("content-type", "").lower()
-            if "image/gif" not in content_type:
-                raise ValueError("Result is not served as an animated GIF")
-            chunks = []
-            total = 0
-            async for chunk in response.aiter_bytes():
-                total += len(chunk)
-                if total > MAX_GIF_BYTES:
-                    raise ValueError("GIF is larger than the 15 MB bot limit")
-                chunks.append(chunk)
-    data = b"".join(chunks)
-    if not (data.startswith(b"GIF87a") or data.startswith(b"GIF89a")):
-        raise ValueError("Downloaded file is not a valid GIF")
-    return data
-
-
-async def send_duckduckgo_results(chat, query: str, page: int = 1):
-    results = await search_duckduckgo_gifs(query, page)
-    sent = 0
-    skipped = 0
-    for item in results:
-        gif_url = item.get("image")
-        if not isinstance(gif_url, str):
-            skipped += 1
-            continue
-        try:
-            data = await download_verified_gif(gif_url)
-            title = str(item.get("title") or query).strip()
-            source_url = str(item.get("url") or "").strip()
-            caption = f"DuckDuckGo GIF · {title}"
-            if source_url.startswith("https://"):
-                caption += f"\n{source_url}"
-            await chat.send_animation(
-                animation=InputFile(__import__("io").BytesIO(data), filename="result.gif"),
-                caption=caption[:1024],
-                read_timeout=30, write_timeout=30, connect_timeout=15, pool_timeout=20,
+                max_results=max_results,
             )
-            sent += 1
-        except Exception as exc:
-            skipped += 1
-            log.info("Skipping DDG result that could not be sent: %s", exc)
-    if sent == 0:
-        await chat.send_message(
-            f"DuckDuckGo found no directly downloadable GIF files for: {query}. "
-            "Some image results are previews or block direct downloads. Try another keyword."
-        )
-    else:
-        await chat.send_message(f"Sent {sent} animated GIF(s) for: {query}" + (f" · skipped {skipped}" if skipped else ""))
+            for item in ddg_gen:
+                gif_url = item.get("image")
+                thumb_url = item.get("thumbnail") or gif_url
+                if gif_url and gif_url.startswith("http"):
+                    results.append({
+                        "gif_url": gif_url,
+                        "thumb_url": thumb_url,
+                        "title": item.get("title", "GIF"),
+                        "width": int(item.get("width", 0)) or None,
+                        "height": int(item.get("height", 0)) or None,
+                    })
+    except Exception as e:
+        logger.error(f"DuckDuckGo search error: {e}")
+    return results
 
 
-async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_age(update, context):
-        return
+async def search_google_gifs(query: str, max_results: int = 10) -> list[dict]:
+    """Fetches GIFs from Google Custom Search JSON API with SafeSearch turned off."""
+    if not GOOGLE_API_KEY or GOOGLE_API_KEY == "YOUR_GOOGLE_API_KEY":
+        return []
 
-    query = " ".join(context.args).strip()
+    url = "https://www.googleapis.com/customsearch/v1"
+    params = {
+        "key": GOOGLE_API_KEY,
+        "cx": GOOGLE_CSE_ID,
+        "q": query,
+        "searchType": "image",
+        "fileType": "gif",
+        "safe": "off",
+        "num": min(max_results, 10),  # Google API max is 10 per request
+    }
+
+    results = []
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url, params=params)
+            if resp.status_code == 200:
+                data = resp.json()
+                for item in data.get("items", []):
+                    gif_url = item.get("link")
+                    image_info = item.get("image", {})
+                    thumb_url = image_info.get("thumbnailLink") or gif_url
+                    if gif_url and gif_url.startswith("http"):
+                        results.append({
+                            "gif_url": gif_url,
+                            "thumb_url": thumb_url,
+                            "title": item.get("title", "GIF"),
+                            "width": int(image_info.get("width", 0)) or None,
+                            "height": int(image_info.get("height", 0)) or None,
+                        })
+            else:
+                logger.warning(f"Google API returned {resp.status_code}: {resp.text}")
+    except Exception as e:
+        logger.error(f"Google search error: {e}")
+    return results
+
+
+async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles incoming inline queries and returns a grid of clickable GIFs."""
+    query = update.inline_query.query.strip()
     if not query:
-        await update.effective_message.reply_text("Usage: /search your keywords")
-        return
-    if len(query) > 100:
-        await update.effective_message.reply_text(
-            "Please keep the search under 100 characters."
-        )
         return
 
-    source = context.user_data.get("search_source", "redgifs")
-    status = await update.effective_message.reply_text(
-        "Searching DuckDuckGo for animated GIFs…" if source == "duckduckgo" else "Searching RedGIFs…"
-    )
-    try:
-        if source == "duckduckgo":
-            await status.delete()
-            await send_duckduckgo_results(update.effective_chat, query, 1)
-        else:
-            await show_search_page(query, 1, update, context, edit_message=status)
-    except Exception:
-        log.exception("%s search failed", source)
-        try:
-            await status.edit_text("Search failed or timed out. Please try again in a moment.")
-        except Exception:
-            await update.effective_message.reply_text("Search failed or timed out. Please try again in a moment.")
+    # Run DuckDuckGo (in thread) and Google Search concurrently
+    ddg_task = asyncio.to_thread(search_ddg_gifs, query, 25)
+    google_task = search_google_gifs(query, 10)
 
-async def inline_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Return silent MP4 animation previews in Telegram's inline GIF-style grid."""
-    inline_query = update.inline_query
-    if inline_query is None:
-        return
+    ddg_results, google_results = await asyncio.gather(ddg_task, google_task)
 
-    # Require users to open the bot and confirm their age before inline searching.
-    if not context.user_data.get("age_ok"):
-        gate_result = InlineQueryResultArticle(
-            id="age-confirmation-required",
-            title="Open the bot and confirm you are 18+",
-            input_message_content=InputTextMessageContent(
-                "Please open the RedGIFs bot, send /start, and confirm that you "
-                "are 18 or older before using inline search."
-            ),
-        )
-        await inline_query.answer(
-            [gate_result], cache_time=0, is_personal=True
-        )
-        return
+    # Deduplicate URLs while combining results (up to Telegram's 50-item limit)
+    seen_urls = set()
+    inline_results = []
 
-    search_text = (inline_query.query or "").strip()
-    if not search_text:
-        await inline_query.answer([], cache_time=1, is_personal=True)
-        return
+    for item in google_results + ddg_results:
+        gif_url = item["gif_url"]
+        if gif_url in seen_urls:
+            continue
+        seen_urls.add(gif_url)
 
-    if len(search_text) > 100:
-        search_text = search_text[:100]
+        kwargs = {
+            "id": str(uuid.uuid4()),
+            "gif_url": gif_url,
+            "thumbnail_url": item["thumb_url"],
+            "title": item["title"][:60],
+        }
+        if item["width"]:
+            kwargs["gif_width"] = item["width"]
+        if item["height"]:
+            kwargs["gif_height"] = item["height"]
 
-    page = 1
-    if inline_query.offset and inline_query.offset.isdigit():
-        page = max(1, int(inline_query.offset))
+        inline_results.append(InlineQueryResultGif(**kwargs))
+
+        if len(inline_results) >= 50:
+            break
 
     try:
-        result = await search_redgifs(
-            search_text,
-            count=INLINE_RESULTS_PER_PAGE,
-            page=page,
-        )
-
-        inline_results = []
-        for gif in (result.gifs or []):
-            gif_id = getattr(gif, "id", None)
-            urls = getattr(gif, "urls", None)
-            if not gif_id or urls is None:
-                continue
-
-            # RedGIFs supplies MP4 media URLs and still-image thumbnail URLs.
-            media_url = getattr(urls, "sd", None) or getattr(urls, "hd", None)
-            thumbnail_url = (
-                getattr(urls, "thumbnail", None)
-                or getattr(urls, "poster", None)
-            )
-
-            if not media_url or not thumbnail_url:
-                continue
-            if not media_url.startswith("https://") or not thumbnail_url.startswith(
-                "https://"
-            ):
-                continue
-
-            result_id = hashlib.sha1(str(gif_id).encode("utf-8")).hexdigest()[:32]
-
-            inline_results.append(
-                InlineQueryResultMpeg4Gif(
-                    id=result_id,
-                    mpeg4_url=media_url,
-                    thumbnail_url=thumbnail_url,
-                )
-            )
-
-        total_pages = getattr(result, "pages", page) or page
-        next_offset = str(page + 1) if page < total_pages else ""
-
-        await inline_query.answer(
-            inline_results,
-            cache_time=30,
-            is_personal=True,
-            next_offset=next_offset,
-        )
-
-    except Exception:
-        log.exception("Inline search failed")
-        # Always answer the inline query so Telegram does not keep waiting.
-        try:
-            await inline_query.answer([], cache_time=1, is_personal=True)
-        except Exception:
-            log.exception("Could not send empty inline-search response")
+        # cache_time=60 caches results briefly on Telegram servers for faster loading
+        await update.inline_query.answer(inline_results, cache_time=60, is_personal=True)
+    except Exception as e:
+        logger.error(f"Failed to answer inline query: {e}")
 
 
-async def download_gif(gif, api):
-    """Download HD first, then SD if HD fails or exceeds Telegram's upload limit."""
-    urls = gif.urls
-    candidates = [getattr(urls, "hd", None), getattr(urls, "sd", None)]
-    candidates = [url for url in candidates if url]
-
-    if not candidates:
-        raise RuntimeError("RedGIFs did not provide a downloadable video URL.")
-
-    last_error = None
-    for media_url in candidates:
-        path = None
-        try:
-            fd, path = tempfile.mkstemp(prefix="redgifs_", suffix=".mp4")
-            os.close(fd)
-            await api.download(media_url, path)
-
-            size = Path(path).stat().st_size
-            if size <= 0:
-                raise RuntimeError("Downloaded file was empty.")
-
-            if size > MAX_UPLOAD_BYTES:
-                Path(path).unlink(missing_ok=True)
-                last_error = RuntimeError(
-                    "Video is larger than Telegram's upload limit."
-                )
-                continue
-
-            return path
-
-        except Exception as exc:
-            last_error = exc
-            if path:
-                Path(path).unlink(missing_ok=True)
-
-    raise RuntimeError(str(last_error or "Could not download this video."))
-
-
-async def send_gif(chat, gif, api, reply_to_message_id=None):
-    path = await download_gif(gif, api)
-    try:
-        caption = f"RedGIFs · @{gif.username}\n{gif.urls.web_url}"
-        with open(path, "rb") as media:
-            await chat.send_video(
-                video=InputFile(media, filename=f"{gif.id}.mp4"),
-                caption=caption[:1024],
-                supports_streaming=True,
-                reply_to_message_id=reply_to_message_id,
-                read_timeout=120,
-                write_timeout=120,
-                connect_timeout=30,
-                pool_timeout=30,
-            )
-    finally:
-        Path(path).unlink(missing_ok=True)
-
-
-async def handle_redgifs_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_age(update, context):
-        return
-
-    message_text = update.effective_message.text or ""
-    match = REDGIFS_LINK_RE.search(message_text)
-    if not match:
-        return
-
-    gif_id = match.group(1)
-    status = await update.effective_message.reply_text("Fetching RedGIFs video…")
-
-    try:
-        api = await get_redgifs()
-        gif = await api.get_gif(gif_id)
-        await context.bot.send_chat_action(
-            chat_id=update.effective_chat.id,
-            action=ChatAction.UPLOAD_VIDEO,
-        )
-        await send_gif(
-            update.effective_chat,
-            gif,
-            api,
-            update.effective_message.message_id,
-        )
-        await status.delete()
-
-    except Exception:
-        log.exception("Link download failed")
-        await status.edit_text(
-            "I couldn't download that video. Check that the link is public and valid, "
-            "or the file may exceed Telegram's upload limit."
-        )
-
-
-async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data or ""
-
-    if data == "age:yes":
-        context.user_data["age_ok"] = True
-        await query.edit_message_text(
-            "Age confirmation saved for this bot session. Use /search keywords "
-            "or type @YourBotUsername followed by keywords in any chat."
-        )
-        return
-
-    if not context.user_data.get("age_ok"):
-        await query.answer(
-            "Please confirm that you are 18 or older first.",
-            show_alert=True,
-        )
-        return
-
-    if data.startswith("source:"):
-        selected = data.split(":", 1)[1]
-        if selected not in {"redgifs", "duckduckgo"}:
-            await query.edit_message_text("Unknown source. Use /source to choose again.")
-            return
-        context.user_data["search_source"] = selected
-        label = "DuckDuckGo animated GIFs (Safe Search Off)" if selected == "duckduckgo" else "RedGIFs videos and downloads"
-        await query.edit_message_text(f"Search source set to {label}. Use /search keywords.")
-        return
-
-    if data.startswith("page:"):
-        try:
-            page = int(data.split(":", 1)[1])
-            search_query = context.user_data.get("search_query")
-            if not search_query:
-                await query.edit_message_text(
-                    "Please start a new search with /search keywords."
-                )
-                return
-
-            await show_search_page(
-                search_query,
-                page,
-                update,
-                context,
-                edit_message=query.message,
-            )
-
-        except Exception:
-            log.exception("Pagination failed")
-            await query.edit_message_text(
-                "Couldn't load that page. Please try /search again."
-            )
-        return
-
-    if data.startswith("pick:"):
-        try:
-            index = int(data.split(":", 1)[1])
-            ids = context.user_data.get("search_ids", [])
-
-            if index < 0 or index >= len(ids):
-                await query.answer(
-                    "That result has expired. Search again.",
-                    show_alert=True,
-                )
-                return
-
-            status = await query.message.reply_text("Preparing selected video…")
-            api = await get_redgifs()
-            gif = await api.get_gif(ids[index])
-
-            await context.bot.send_chat_action(
-                chat_id=query.message.chat_id,
-                action=ChatAction.UPLOAD_VIDEO,
-            )
-            await send_gif(
-                query.message.chat,
-                gif,
-                api,
-                query.message.message_id,
-            )
-            await status.delete()
-
-        except Exception:
-            log.exception("Selected result download failed")
-            await query.message.reply_text(
-                "Couldn't send that video. Try another result."
-            )
-        return
-
-
-async def log_incoming_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Log delivery without logging message text, links, or other private content."""
-    user = update.effective_user
-    chat = update.effective_chat
-    update_kind = (
-        "message" if update.message else
-        "callback_query" if update.callback_query else
-        "inline_query" if update.inline_query else
-        "other"
-    )
-    log.info(
-        "Incoming Telegram update id=%s type=%s user_id=%s chat_id=%s",
-        update.update_id,
-        update_kind,
-        user.id if user else None,
-        chat.id if chat else None,
-    )
-
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    log.exception("Unhandled Telegram update error", exc_info=context.error)
-
-
-def main():
-    # Multiple updates can be processed at once. Without this, a slow video
-    # download/upload can hold up /start, /help, searches, and button presses.
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .concurrent_updates(8)
-        .connection_pool_size(20)
-        .pool_timeout(30)
-        .build()
-    )
-
-    # Group -1 logs every incoming update before the command handlers run.
-    app.add_handler(TypeHandler(Update, log_incoming_update), group=-1)
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("search", search_command))
-    app.add_handler(CommandHandler("source", source_command))
-    app.add_handler(InlineQueryHandler(inline_search))
-    app.add_handler(CallbackQueryHandler(callbacks))
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_redgifs_link)
-    )
-    app.add_error_handler(error_handler)
-
-    external_url = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
-    if not external_url:
-        raise RuntimeError(
-            "RENDER_EXTERNAL_URL is missing. Deploy this project as a Render Web Service."
-        )
-
-    webhook_url = f"{external_url}/{WEBHOOK_PATH}"
-    log.info("Starting webhook server on port %s", PORT)
-
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=WEBHOOK_PATH,
-        webhook_url=webhook_url,
-        secret_token=WEBHOOK_SECRET,
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-    )
+def main() -> None:
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(InlineQueryHandler(inline_query_handler))
+    print("Bot is running... Type @YourBotUsername <search term> in any Telegram chat.")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
