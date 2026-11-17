@@ -1,4 +1,3 @@
-python-telegram-bot[webhooks]==22.8
-redgifs==2.4.0
-httpx==0.28.1
-ddgs==9.12.0
+python-telegram-bot>=20.0
+duckduckgo-search>=4.0.0
+httpx>=0.24.0
