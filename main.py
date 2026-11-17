@@ -45,6 +45,52 @@ def _valid_http_url(value: Any) -> bool:
     return parsed.scheme in ("http", "https") and bool(parsed.netloc)
 
 
+
+async def _is_real_gif(client: httpx.AsyncClient, url: str) -> bool:
+    """Check the actual response bytes; search engines can label static images as GIFs."""
+    if not _valid_http_url(url):
+        return False
+    try:
+        async with client.stream(
+            "GET",
+            url,
+            headers={
+                "Range": "bytes=0-15",
+                "User-Agent": "Mozilla/5.0 (compatible; TelegramGifSearchBot/1.0)",
+            },
+        ) as response:
+            if response.status_code not in (200, 206):
+                return False
+            content_type = response.headers.get("content-type", "").lower()
+            first_bytes = b""
+            async for chunk in response.aiter_bytes():
+                first_bytes += chunk
+                if len(first_bytes) >= 6:
+                    break
+            # GIF87a and GIF89a are the file signatures. MIME alone is not trusted.
+            # The byte signature is authoritative; some CDNs mislabel MIME types.
+            return first_bytes[:6] in (b"GIF87a", b"GIF89a")
+    except Exception:
+        return False
+
+
+async def keep_real_gifs(items: list[dict], limit: int = 25) -> list[dict]:
+    """Filter dead URLs, HTML pages, thumbnails, and static images before Telegram sees them."""
+    timeout = httpx.Timeout(6.0, connect=4.0)
+    limits = httpx.Limits(max_connections=12, max_keepalive_connections=6)
+    async with httpx.AsyncClient(
+        timeout=timeout, follow_redirects=True, limits=limits
+    ) as client:
+        semaphore = asyncio.Semaphore(10)
+
+        async def check(item: dict) -> tuple[dict, bool]:
+            async with semaphore:
+                return item, await _is_real_gif(client, item["gif_url"])
+
+        checked = await asyncio.gather(*(check(item) for item in items))
+    return [item for item, valid in checked if valid][:limit]
+
+
 def search_ddg(query: str, limit: int = 25) -> list[dict]:
     """DuckDuckGo image search. Provider results are not guaranteed to stay stable."""
     found = []
@@ -139,7 +185,9 @@ async def search_all(query: str, limit: int = 35) -> list[dict]:
         unique.append(item)
         if len(unique) >= limit:
             break
-    return unique
+    # Search providers sometimes return a static thumbnail or an HTML page
+    # despite the GIF filter. Only pass real GIF files to Telegram.
+    return await keep_real_gifs(unique, limit=limit)
 
 
 def _dimension(value: Any) -> int | None:
@@ -178,7 +226,8 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if not results:
         await status.edit_text(
-            "No GIF results came back. Try different keywords. "
+            "No directly accessible animated GIF files were found. Try different keywords. "
+            "Some search results are static previews or block Telegram access. "
             "Google results also require a valid Google API key and Search Engine ID."
         )
         return
@@ -276,12 +325,8 @@ async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 "thumbnail_url": item["thumb_url"],
                 "title": (item.get("title") or "GIF")[:60],
             }
-            width = _dimension(item.get("width"))
-            height = _dimension(item.get("height"))
-            if width:
-                kwargs["gif_width"] = width
-            if height:
-                kwargs["gif_height"] = height
+            # Deliberately omit provider width/height: incorrect dimensions can
+            # make Telegram's inline preview render with a broken aspect ratio.
             inline_results.append(InlineQueryResultGif(**kwargs))
 
         await update.inline_query.answer(
