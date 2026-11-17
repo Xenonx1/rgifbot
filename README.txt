@@ -1,27 +1,19 @@
-DUCKDUCKGO-ONLY TELEGRAM GIF BOT (v2)
+GIFREELS TELEGRAM BOT (18+)
 
-WHAT CHANGED
-- Switched from the deprecated "duckduckgo-search" package to its maintained successor "ddgs".
-- DuckDuckGo backend is forced (backend="duckduckgo"), SafeSearch is "off", GIF filter is on.
-- Every result is checked before it is shown: the file must start with GIF87a/GIF89a magic bytes.
-  Static images, HTML pages and dead/blocked links are dropped.
-- GIFs of 1 MB or less (Telegram's inline limit) are ranked first. Larger ones (up to MAX_GIF_MB, default 5) come after.
-- If DuckDuckGo's GIF filter returns too few, a second pass searches "<query> gif".
-- Thumbnail = the verified GIF itself (mime image/gif), so previews are no longer blank.
-- /search: if Telegram can't fetch the URL, the bot downloads the GIF and uploads it directly.
-- Results cached 10 min; duplicate queries share one search; webhook replies instantly.
-- Removed delete_webhook on shutdown (it could break the bot during Render redeploys).
-- Self-ping every 10 min keeps the Render free plan awake (set KEEP_ALIVE=0 to disable).
-- New /debug <query> command shows raw results, real GIFs found, and why others failed.
+- Searches gifreels.com (no DuckDuckGo anymore).
+- Inline mode: @YourBot latina -> animated previews -> tap one -> it is sent to that chat.
+- /search <words> in a private chat: paged list, tap to send.
+- /debug <words>: shows which gifreels URL worked, how many GIFs were found/usable, and why others failed.
 
-DEPLOY
-1. Replace the files in your GitHub repo with these (keep the hidden .python-version).
-2. Commit and push.
-3. Render: Manual Deploy > Clear build cache & deploy.
-4. Env var needed: BOT_TOKEN. Optional: MAX_GIF_MB (1 = strict), DDG_REGION, KEEP_ALIVE, LOG_LEVEL.
-5. Test: /search cats, then /debug cats, then @YourBot cats inline.
-6. Inline mode must be on: @BotFather > /setinline.
+HOW SEARCH WORKS
+Tries, in order: GIFREELS_SEARCH_URL (if you set it), https://gifreels.com/tag/<words-with-dashes>,
+https://gifreels.com/search?q=<words>. GIFs are played from the site's MP4 files
+(https://p5rn.com/cdn/storage/production/gifreels/post/<id>/gif.mp4).
 
-NOTE
-Some source sites block Telegram's servers. Inline mode can't work around that; the checks only
-reduce it. If something still fails, send me the /debug output and the Render log.
+RENDER
+- Build: pip install -r requirements.txt   Start: python main.py   Health: /health
+- Env: BOT_TOKEN (required). Optional: GIFREELS_SEARCH_URL, MAX_GIF_MB (default 5, use 1 for strict),
+  KEEP_ALIVE=0, LOG_LEVEL.
+- Deploy: replace repo files with ALL files here (main.py, gifreels.py, requirements.txt, render.yaml,
+  .python-version), push, then Manual Deploy > Clear build cache & deploy.
+- BotFather: /setinline must be enabled.

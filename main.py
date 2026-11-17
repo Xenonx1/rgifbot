@@ -6,16 +6,14 @@ import re
 import signal
 import time
 from collections import Counter
-from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote
 
 import aiohttp
 from aiohttp import web
-from ddgs import DDGS
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    InlineQueryResultGif,
+    InlineQueryResultMpeg4Gif,
     InputFile,
     Update,
 )
@@ -28,6 +26,8 @@ from telegram.ext import (
     InlineQueryHandler,
 )
 
+from gifreels import SITE, add_page, media_url, parse_listing, slugify
+
 # --------------------------------------------------------------------------- #
 # Config
 # --------------------------------------------------------------------------- #
@@ -35,132 +35,149 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 PORT = int(os.getenv("PORT", "10000"))
 RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 
-DDG_REGION = os.getenv("DDG_REGION", "us-en")
-DDG_TIMEOUT = 10                 # seconds for the DuckDuckGo request itself
-CANDIDATES = int(os.getenv("DDG_CANDIDATES", "80"))
+# Where to look for results. {slug} = "big-tits", {q} = url-encoded query.
+# If you find the site's real search URL (browser dev tools > Network), set it
+# in Render as GIFREELS_SEARCH_URL, e.g.  https://gifreels.com/search?q={q}
+SEARCH_TEMPLATES = [
+    t for t in (
+        os.getenv("GIFREELS_SEARCH_URL"),
+        f"{SITE}/tag/{{slug}}",
+        f"{SITE}/search?q={{q}}",
+    ) if t
+]
+MAX_PAGES = 3
+WANT_CANDIDATES = 60
 
-SMALL_GIF_BYTES = 1024 * 1024    # Telegram's documented inline GIF limit (1 MB)
-MAX_GIF_BYTES = int(float(os.getenv("MAX_GIF_MB", "5")) * 1024 * 1024)
+SMALL_BYTES = 1024 * 1024        # Telegram's documented inline limit (1 MB)
+MAX_BYTES = int(float(os.getenv("MAX_GIF_MB", "5")) * 1024 * 1024)
 DOWNLOAD_LIMIT = 20 * 1024 * 1024
 
-VERIFY_CONCURRENCY = 30
-VERIFY_TIMEOUT = 4               # seconds per GIF check
-INLINE_BUDGET = 7.0              # total seconds for an inline query
-SEARCH_BUDGET = 15.0             # total seconds for /search
+VERIFY_CONCURRENCY = 20
+VERIFY_TIMEOUT = 4
+PAGE_TIMEOUT = 8
+INLINE_BUDGET = 8.0
+SEARCH_BUDGET = 15.0
 INLINE_TARGET = 30
 SEARCH_TARGET = 40
-ENOUGH_SMALL = 15                # skip the 2nd DDG pass if we already have this many <=1MB GIFs
-
 PAGE_SIZE = 10
 CACHE_TTL = 600
 CACHE_MAX = 200
 KEEP_ALIVE = os.getenv("KEEP_ALIVE", "1") != "0"
 
-# Telegram's own fetcher identifies like this; some hosts treat it differently from a browser.
-VERIFY_UA = "TelegramBot (like TwitterBot)"
-GIF_MAGIC = (b"GIF87a", b"GIF89a")
-NOT_GIF_EXT = (".jpg", ".jpeg", ".png", ".webp", ".svg", ".bmp", ".avif", ".ico", ".mp4", ".webm")
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+TELEGRAM_UA = "TelegramBot (like TwitterBot)"
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-log = logging.getLogger("ddg-gif-bot")
+log = logging.getLogger("gifreels-bot")
 
-DDG_SEM = asyncio.Semaphore(2)   # DuckDuckGo rate-limits aggressively
+SITE_SEM = asyncio.Semaphore(4)
 CACHE: dict[str, tuple[float, list[dict]]] = {}
 INFLIGHT: dict[str, asyncio.Task] = {}
 BACKGROUND: set[asyncio.Task] = set()
 
 
 # --------------------------------------------------------------------------- #
-# DuckDuckGo search (images, GIF filter, SafeSearch OFF, DuckDuckGo backend only)
+# gifreels.com scraping
 # --------------------------------------------------------------------------- #
-def is_http_url(value: Any) -> bool:
-    return (
-        isinstance(value, str)
-        and value.startswith(("https://", "http://"))
-        and len(value) < 2000
-    )
-
-
-def _int(value: Any) -> int | None:
+async def fetch_listing(session: aiohttp.ClientSession, url: str, fails: Counter):
+    """Returns (html or None, status or error text)."""
     try:
-        number = int(value)
-        return number if number > 0 else None
-    except (TypeError, ValueError):
-        return None
+        async with SITE_SEM:
+            async with session.get(
+                url,
+                headers=BROWSER_HEADERS,
+                timeout=aiohttp.ClientTimeout(total=PAGE_TIMEOUT),
+            ) as resp:
+                if resp.status != 200:
+                    fails[f"page_http_{resp.status}"] += 1
+                    return None, resp.status
+                return await resp.text(errors="ignore"), 200
+    except asyncio.TimeoutError:
+        fails["page_timeout"] += 1
+        return None, "timeout"
+    except aiohttp.ClientError as exc:
+        fails["page_connection_error"] += 1
+        return None, type(exc).__name__
 
 
-def ddg_images(query: str, type_image: str | None, limit: int) -> tuple[list[dict], str | None]:
-    """Blocking DuckDuckGo image search. Returns (items, error_text)."""
-    error = None
-    for attempt in range(2):
-        try:
-            items = DDGS(timeout=DDG_TIMEOUT).images(
-                query,
-                region=DDG_REGION,
-                safesearch="off",          # SafeSearch OFF
-                type_image=type_image,     # "gif" filter (only a hint; we verify below)
-                max_results=limit,
-                backend="duckduckgo",      # never fall back to Bing etc.
-            )
-            return list(items or []), None
-        except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"[:300]
-            log.warning("DuckDuckGo search failed (attempt %d): %s", attempt + 1, error)
-            if "no results" in error.lower():
-                break
-            time.sleep(1.0)
-    return [], error
-
-
-def to_candidate(item: dict, order: int) -> dict | None:
-    url = item.get("image")
-    if not is_http_url(url):
-        return None
-    path = urlparse(url).path.lower()
-    if path.endswith(NOT_GIF_EXT):
-        return None
-    return {
-        "gif_url": url,
-        "title": (item.get("title") or "GIF")[:100],
-        "width": _int(item.get("width")),
-        "height": _int(item.get("height")),
-        "order": order,
-        "gif_ext": path.endswith(".gif"),
-    }
-
-
-# --------------------------------------------------------------------------- #
-# GIF verification: only keep URLs that really serve a GIF file
-# --------------------------------------------------------------------------- #
-async def verify_gif(
+async def gather_candidates(
     session: aiohttp.ClientSession,
-    sem: asyncio.Semaphore,
-    cand: dict,
+    query: str,
+    deadline: float,
     fails: Counter,
-) -> dict | None:
+    stats: list | None,
+) -> list[dict]:
+    loop = asyncio.get_running_loop()
+    slug = slugify(query)
+
+    for template in SEARCH_TEMPLATES:
+        if deadline - loop.time() < 2.0:
+            break
+        base = template.replace("{slug}", slug).replace("{q}", quote(query))
+        items: dict[str, dict] = {}
+
+        for page in range(1, MAX_PAGES + 1):
+            url = base if page == 1 else add_page(base, page)
+            html, status = await fetch_listing(session, url, fails)
+            entry = {"url": url, "status": status, "ids": 0}
+            if stats is not None:
+                stats.append(entry)
+            if not html:
+                break
+            page_items = parse_listing(html)
+            entry["ids"] = len(page_items)
+            new = [i for i in page_items if i["id"] not in items]
+            if not new:
+                break
+            for item in new:
+                items[item["id"]] = item
+            if len(items) >= WANT_CANDIDATES or deadline - loop.time() < 2.0:
+                break
+
+        if items:
+            return [
+                {
+                    "id": item["id"],
+                    "title": item["title"],
+                    "media_url": media_url(item["id"]),
+                    "order": order,
+                }
+                for order, item in enumerate(items.values())
+            ]
+    return []
+
+
+# --------------------------------------------------------------------------- #
+# Check that each MP4 really exists and is small enough for Telegram
+# --------------------------------------------------------------------------- #
+async def verify_media(session, sem, cand: dict, fails: Counter) -> dict | None:
     try:
         async with sem:
             async with session.get(
-                cand["gif_url"],
-                headers={
-                    "Range": "bytes=0-2047",
-                    "Accept": "image/gif,image/*;q=0.8,*/*;q=0.5",
-                },
+                cand["media_url"],
+                headers={"User-Agent": TELEGRAM_UA, "Range": "bytes=0-1023", "Accept": "*/*"},
                 max_redirects=3,
             ) as resp:
                 if resp.status not in (200, 206):
-                    fails[f"http_{resp.status}"] += 1
+                    fails[f"media_http_{resp.status}"] += 1
                     return None
                 try:
-                    head = await resp.content.readexactly(6)
+                    head = await resp.content.readexactly(12)
                 except asyncio.IncompleteReadError:
-                    fails["empty"] += 1
+                    fails["media_empty"] += 1
                     return None
-                if head not in GIF_MAGIC:
-                    fails["not_a_gif"] += 1
+                if head[4:8] != b"ftyp":
+                    fails["media_not_mp4"] += 1
                     return None
 
                 size = None
@@ -171,36 +188,24 @@ async def verify_gif(
                 elif resp.content_length is not None:
                     size = resp.content_length
 
-                if size is not None and size > MAX_GIF_BYTES:
-                    fails["too_big"] += 1
+                if size is not None and size > MAX_BYTES:
+                    fails["media_too_big"] += 1
                     return None
-
-                if size is None:
-                    rank = 1
-                elif size <= SMALL_GIF_BYTES:
-                    rank = 0
-                else:
-                    rank = 2
+                rank = 1 if size is None else (0 if size <= SMALL_BYTES else 2)
                 return {**cand, "size": size, "rank": rank}
     except asyncio.TimeoutError:
-        fails["timeout"] += 1
+        fails["media_timeout"] += 1
     except aiohttp.ClientError:
-        fails["connection_error"] += 1
+        fails["media_connection_error"] += 1
     except Exception:
-        fails["other_error"] += 1
+        fails["media_other_error"] += 1
     return None
 
 
-async def verify_many(
-    session: aiohttp.ClientSession,
-    cands: list[dict],
-    deadline: float,
-    target: int,
-    fails: Counter,
-) -> list[dict]:
+async def verify_many(session, cands, deadline, target, fails) -> list[dict]:
     loop = asyncio.get_running_loop()
     sem = asyncio.Semaphore(VERIFY_CONCURRENCY)
-    tasks = [asyncio.create_task(verify_gif(session, sem, c, fails)) for c in cands]
+    tasks = [asyncio.create_task(verify_media(session, sem, c, fails)) for c in cands]
     found: list[dict] = []
     pending = set(tasks)
     try:
@@ -212,9 +217,8 @@ async def verify_many(
                 pending, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
             )
             for task in done:
-                result = task.result()
-                if result:
-                    found.append(result)
+                if task.result():
+                    found.append(task.result())
     finally:
         for task in tasks:
             if not task.done():
@@ -223,72 +227,22 @@ async def verify_many(
     return found
 
 
-async def find_gifs(
-    session: aiohttp.ClientSession,
-    query: str,
-    budget: float,
-    target: int,
-    stats: list | None = None,
-) -> list[dict]:
+async def find_gifs(session, query: str, budget: float, target: int, stats: list | None = None):
     loop = asyncio.get_running_loop()
     deadline = loop.time() + budget
-    seen: set[str] = set()
-    verified: list[dict] = []
     fails: Counter = Counter()
 
-    # Pass 1: DuckDuckGo's own GIF filter. Pass 2: plain "<query> gif" as a fallback.
-    passes = [(query, "gif"), (f"{query} gif", None)]
-    for pass_no, (q, kind) in enumerate(passes):
-        remaining = deadline - loop.time()
-        if remaining < 2.0:
-            break
+    cands = await gather_candidates(session, query, deadline, fails, stats)
+    verified = await verify_many(session, cands, deadline, target, fails)
+    verified.sort(key=lambda v: (v["rank"], v["order"]))
 
-        try:
-            async with DDG_SEM:
-                items, error = await asyncio.wait_for(
-                    asyncio.to_thread(ddg_images, q, kind, CANDIDATES),
-                    timeout=remaining - 1.0,
-                )
-        except asyncio.TimeoutError:
-            items, error = [], "DuckDuckGo search timed out"
-
-        cands = []
-        for index, item in enumerate(items):
-            cand = to_candidate(item, index)
-            if cand and cand["gif_url"] not in seen:
-                seen.add(cand["gif_url"])
-                cand["pass"] = pass_no
-                cands.append(cand)
-        cands.sort(key=lambda c: not c["gif_ext"])  # stable: .gif URLs first
-
-        found = await verify_many(session, cands, deadline, target - len(verified), fails)
-        verified.extend(found)
-
-        if stats is not None:
-            stats.append({
-                "query": q,
-                "type": kind,
-                "raw": len(items),
-                "candidates": len(cands),
-                "verified": len(found),
-                "small": sum(1 for f in found if f["rank"] == 0),
-                "error": error,
-            })
-
-        small = sum(1 for v in verified if v["rank"] == 0)
-        if small >= ENOUGH_SMALL or len(verified) >= target:
-            break
-
-    verified.sort(key=lambda v: (v["rank"], v["pass"], v["order"]))
-    log.info("search %r -> %d GIFs (verify failures: %s)", query, len(verified), dict(fails))
+    log.info("search %r -> %d candidates, %d usable (%s)", query, len(cands), len(verified), dict(fails))
     if stats is not None:
-        stats.append({"fails": dict(fails)})
+        stats.append({"candidates": len(cands), "usable": len(verified), "fails": dict(fails)})
     return verified[:50]
 
 
-async def get_gifs(
-    session: aiohttp.ClientSession, query: str, budget: float, target: int
-) -> list[dict]:
+async def get_gifs(session, query: str, budget: float, target: int) -> list[dict]:
     key = query.casefold()
     hit = CACHE.get(key)
     if hit and time.monotonic() - hit[0] < CACHE_TTL:
@@ -313,38 +267,38 @@ async def get_gifs(
 # --------------------------------------------------------------------------- #
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
-        "DuckDuckGo GIF Search Bot\n\n"
-        "Private search: /search cats\n"
-        "Inline search: type @YourBotUsername cats in any Telegram chat.\n\n"
-        "DuckDuckGo only. SafeSearch is OFF. Only real GIF files are returned."
+        "GifReels Search Bot (18+ adult content)\n\n"
+        "Private search: /search big tits\n"
+        "Inline search: type @YourBotUsername latina in any chat, "
+        "pick a result and it is sent to that chat.\n\n"
+        "Results come from gifreels.com."
     )
 
 
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = " ".join(context.args).strip()
     if not query:
-        await update.effective_message.reply_text("Usage: /search cats")
+        await update.effective_message.reply_text("Usage: /search latina")
         return
 
-    status = await update.effective_message.reply_text("Searching DuckDuckGo for GIFs…")
+    status = await update.effective_message.reply_text("Searching gifreels.com…")
     session = context.application.bot_data["http"]
     results = await get_gifs(session, query, SEARCH_BUDGET, SEARCH_TARGET)
-    context.user_data["ddg_results"] = {"query": query, "items": results}
+    context.user_data["results"] = {"query": query, "items": results}
 
     if not results:
         await status.edit_text(
-            "No working GIFs found for that search. Try different keywords.\n"
-            "(Admin tip: /debug " + query + " shows what went wrong.)"
+            f"No GIFs found for “{query}”. Try a simpler keyword (e.g. a tag like “latina”).\n"
+            f"Admin: /debug {query}"
         )
         return
-
     await show_page(status, context, 0)
 
 
 async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = " ".join(context.args).strip()
     if not query:
-        await update.effective_message.reply_text("Usage: /debug cats")
+        await update.effective_message.reply_text("Usage: /debug latina")
         return
 
     status = await update.effective_message.reply_text("Running diagnostics…")
@@ -352,25 +306,22 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     stats: list = []
     results = await find_gifs(session, query, SEARCH_BUDGET, SEARCH_TARGET, stats)
 
-    lines = [f"Query: {query}", f"Final GIFs: {len(results)}"]
+    lines = [f"Query: {query}", f"Usable GIFs: {len(results)}"]
     for entry in stats:
         if "fails" in entry:
-            lines.append(f"Verify failures: {entry['fails'] or 'none'}")
-        else:
             lines.append(
-                f"Search '{entry['query']}' (type={entry['type']}): "
-                f"raw {entry['raw']}, tested {entry['candidates']}, "
-                f"real GIFs {entry['verified']} (<=1MB: {entry['small']})"
+                f"Candidates: {entry['candidates']}, usable: {entry['usable']}\n"
+                f"Failures: {entry['fails'] or 'none'}"
             )
-            if entry["error"]:
-                lines.append(f"  DDG error: {entry['error']}")
+        else:
+            lines.append(f"GET {entry['url']} -> {entry['status']}, gif links: {entry['ids']}")
     if results:
-        lines.append(f"First: {results[0]['gif_url'][:150]}")
+        lines.append(f"First: {results[0]['media_url']} ({results[0].get('size')} bytes)")
     await status.edit_text("\n".join(lines)[:3900], disable_web_page_preview=True)
 
 
 async def show_page(message, context: ContextTypes.DEFAULT_TYPE, page: int) -> None:
-    state = context.user_data.get("ddg_results", {})
+    state = context.user_data.get("results", {})
     items = state.get("items", [])
     query = state.get("query", "")
     pages = max(1, (len(items) + PAGE_SIZE - 1) // PAGE_SIZE)
@@ -378,14 +329,13 @@ async def show_page(message, context: ContextTypes.DEFAULT_TYPE, page: int) -> N
 
     first = page * PAGE_SIZE
     current = items[first:first + PAGE_SIZE]
-    keyboard = []
-
-    for offset, item in enumerate(current):
-        index = first + offset
-        title = item.get("title") or f"GIF {index + 1}"
-        keyboard.append([
-            InlineKeyboardButton(f"{index + 1}. {title[:35]}", callback_data=f"send:{index}")
-        ])
+    keyboard = [
+        [InlineKeyboardButton(
+            f"{first + i + 1}. {(item.get('title') or 'GIF')[:35]}",
+            callback_data=f"send:{first + i}",
+        )]
+        for i, item in enumerate(current)
+    ]
 
     nav = []
     if page > 0:
@@ -397,7 +347,7 @@ async def show_page(message, context: ContextTypes.DEFAULT_TYPE, page: int) -> N
 
     try:
         await message.edit_text(
-            f"DuckDuckGo GIF results for: {query}\n"
+            f"GifReels results for: {query}\n"
             f"Showing {first + 1}–{first + len(current)} of {len(items)}.\n"
             "Tap a result to send it.",
             reply_markup=InlineKeyboardMarkup(keyboard),
@@ -406,7 +356,7 @@ async def show_page(message, context: ContextTypes.DEFAULT_TYPE, page: int) -> N
         log.debug("edit_text skipped: %s", exc)
 
 
-async def download_gif(session: aiohttp.ClientSession, url: str) -> bytes | None:
+async def download_media(session: aiohttp.ClientSession, url: str) -> bytes | None:
     try:
         async with session.get(
             url, timeout=aiohttp.ClientTimeout(total=30), max_redirects=3
@@ -421,27 +371,26 @@ async def download_gif(session: aiohttp.ClientSession, url: str) -> bytes | None
                 if len(buf) > DOWNLOAD_LIMIT:
                     return None
         data = bytes(buf)
-        return data if data[:6] in GIF_MAGIC else None
+        return data if data[4:8] == b"ftyp" else None
     except Exception:
         return None
 
 
 async def send_gif(context: ContextTypes.DEFAULT_TYPE, chat_id: int, item: dict) -> bool:
-    caption = (item.get("title") or "GIF")[:900]
+    caption = (item.get("title") or "")[:900] or None
     try:
-        await context.bot.send_animation(chat_id=chat_id, animation=item["gif_url"], caption=caption)
+        await context.bot.send_animation(chat_id=chat_id, animation=item["media_url"], caption=caption)
         return True
     except TelegramError as exc:
         log.info("Telegram could not fetch the URL (%s); uploading the file instead", exc)
 
-    # Fallback: the source host blocks Telegram's fetcher, so download and upload it ourselves.
-    data = await download_gif(context.application.bot_data["http"], item["gif_url"])
+    data = await download_media(context.application.bot_data["http"], item["media_url"])
     if not data:
         return False
     try:
         await context.bot.send_animation(
             chat_id=chat_id,
-            animation=InputFile(data, filename="duckduckgo.gif"),
+            animation=InputFile(data, filename="gifreels.mp4"),
             caption=caption,
         )
         return True
@@ -453,12 +402,11 @@ async def send_gif(context: ContextTypes.DEFAULT_TYPE, chat_id: int, item: dict)
 async def result_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     callback = update.callback_query
     kind, _, arg = (callback.data or "").partition(":")
-    state = context.user_data.get("ddg_results")
+    state = context.user_data.get("results")
 
     if not state:
         await callback.answer("Results expired. Please search again.", show_alert=True)
         return
-
     try:
         number = int(arg)
     except ValueError:
@@ -476,11 +424,9 @@ async def result_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await callback.answer("Result unavailable. Search again.", show_alert=True)
             return
         await callback.answer("Sending…")
-        ok = await send_gif(context, update.effective_chat.id, items[number])
-        if not ok:
+        if not await send_gif(context, update.effective_chat.id, items[number]):
             await context.bot.send_message(
-                update.effective_chat.id,
-                "Telegram could not load that GIF. Try another result.",
+                update.effective_chat.id, "Telegram could not load that GIF. Try another result."
             )
 
 
@@ -495,24 +441,17 @@ async def inline_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     session = context.application.bot_data["http"]
     items = await get_gifs(session, query, INLINE_BUDGET, INLINE_TARGET)
 
-    results = []
-    for item in items[:50]:
-        result_id = hashlib.sha256(item["gif_url"].encode()).hexdigest()[:32]
-        extra = {}
-        if item.get("width") and item.get("height"):
-            extra = {"gif_width": item["width"], "gif_height": item["height"]}
-        results.append(
-            InlineQueryResultGif(
-                id=result_id,
-                gif_url=item["gif_url"],
-                # The file is verified to be a real GIF, so it doubles as its own thumbnail.
-                thumbnail_url=item["gif_url"],
-                thumbnail_mime_type="image/gif",
-                title=item["title"][:60],
-                **extra,
-            )
+    results = [
+        InlineQueryResultMpeg4Gif(
+            id=item["id"][:64],
+            mpeg4_url=item["media_url"],
+            # The MP4 doubles as its own animated preview (Telegram accepts video/mp4 thumbnails).
+            thumbnail_url=item["media_url"],
+            thumbnail_mime_type="video/mp4",
+            title=(item.get("title") or "GIF")[:60],
         )
-
+        for item in items[:50]
+    ]
     await safe_answer(inline_query, results, cache_time=60 if results else 3)
 
 
@@ -520,8 +459,7 @@ async def safe_answer(inline_query, results, cache_time: int) -> None:
     try:
         await inline_query.answer(results, cache_time=cache_time, is_personal=False)
     except TelegramError as exc:
-        # Usually "query is too old": the user kept typing, nothing to do.
-        log.info("Could not answer inline query: %s", exc)
+        log.info("Could not answer inline query: %s", exc)  # usually "query is too old"
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -532,7 +470,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 # Web server (Render health check + Telegram webhook)
 # --------------------------------------------------------------------------- #
 async def health(request: web.Request) -> web.Response:
-    return web.json_response({"status": "ok", "bot": "duckduckgo-gif-search"})
+    return web.json_response({"status": "ok", "bot": "gifreels-search"})
 
 
 async def process_update_safely(app: Application, update: Update) -> None:
@@ -549,7 +487,7 @@ async def telegram_webhook(request: web.Request) -> web.Response:
     except Exception:
         return web.Response(status=400, text="bad request")
 
-    # Return immediately so Telegram never times out or retries while we search.
+    # Reply instantly so Telegram never times out or retries while we search.
     task = asyncio.create_task(process_update_safely(app, update))
     BACKGROUND.add(task)
     task.add_done_callback(BACKGROUND.discard)
@@ -557,7 +495,7 @@ async def telegram_webhook(request: web.Request) -> web.Response:
 
 
 async def keep_alive(session: aiohttp.ClientSession) -> None:
-    """Ping our own public URL so Render's free plan doesn't put the service to sleep."""
+    """Ping our own public URL so Render's free plan doesn't sleep."""
     while True:
         await asyncio.sleep(600)
         try:
@@ -576,7 +514,7 @@ async def main() -> None:
     session = aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=VERIFY_TIMEOUT),
         connector=aiohttp.TCPConnector(limit=60, ttl_dns_cache=300),
-        headers={"User-Agent": VERIFY_UA},
+        headers={"User-Agent": TELEGRAM_UA},
     )
 
     telegram_app = Application.builder().token(BOT_TOKEN).build()
@@ -589,7 +527,6 @@ async def main() -> None:
     telegram_app.add_handler(InlineQueryHandler(inline_search))
     telegram_app.add_error_handler(on_error)
 
-    # A private webhook path avoids exposing the bot token in the URL.
     secret = hashlib.sha256(BOT_TOKEN.encode()).hexdigest()[:32]
     webhook_path = f"/telegram/{secret}"
 
@@ -612,7 +549,7 @@ async def main() -> None:
         drop_pending_updates=True,
         max_connections=40,
     )
-    log.info("DuckDuckGo GIF bot started; webhook configured.")
+    log.info("GifReels bot started; webhook configured.")
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -626,8 +563,8 @@ async def main() -> None:
     try:
         await stop.wait()
     finally:
-        # Do NOT delete the webhook here: during a Render redeploy the old instance
-        # shuts down after the new one registered its webhook, which would break the bot.
+        # Don't delete the webhook: during a Render redeploy the old instance shuts down
+        # after the new one registered it, which would break the bot.
         if keep_alive_task:
             keep_alive_task.cancel()
         await runner.cleanup()
