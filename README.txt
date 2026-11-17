@@ -17,3 +17,8 @@ RENDER
 - Deploy: replace repo files with ALL files here (main.py, gifreels.py, requirements.txt, render.yaml,
   .python-version), push, then Manual Deploy > Clear build cache & deploy.
 - BotFather: /setinline must be enabled.
+
+ENDLESS SCROLL (inline)
+Each inline answer loads several site pages (?page=2, 3, ...) and tells Telegram where to continue
+(next_offset), so more GIFs load as you scroll. If the site uses a different paging parameter, set
+GIFREELS_PAGE_PARAM (default "page"). /debug <words> shows how many gif links each page returned.

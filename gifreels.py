@@ -28,8 +28,8 @@ def media_url(gif_id: str) -> str:
     return MEDIA_URL.format(id=gif_id)
 
 
-def add_page(url: str, page: int) -> str:
-    return f"{url}{'&' if '?' in url else '?'}page={page}"
+def add_page(url: str, page: int, param: str = "page") -> str:
+    return f"{url}{'&' if '?' in url else '?'}{param}={page}"
 
 
 def _clean_title(inner_html: str) -> str:
