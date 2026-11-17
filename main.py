@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import logging
 import os
+from collections import OrderedDict
 from typing import Any
 from urllib.parse import urlparse
 
@@ -30,6 +31,10 @@ PORT = int(os.getenv("PORT", "10000"))
 PAGE_SIZE = 10
 INLINE_PAGE_SIZE = 25
 SEARCH_TIMEOUT = 18
+MAX_GIF_BYTES = 8 * 1024 * 1024
+MAX_CACHE_BYTES = 64 * 1024 * 1024
+GIF_CACHE: OrderedDict[str, bytes] = OrderedDict()
+GIF_CACHE_SIZE = 0
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -46,49 +51,102 @@ def _valid_http_url(value: Any) -> bool:
 
 
 
-async def _is_real_gif(client: httpx.AsyncClient, url: str) -> bool:
-    """Check the actual response bytes; search engines can label static images as GIFs."""
-    if not _valid_http_url(url):
-        return False
+async def _download_gif(client: httpx.AsyncClient, item: dict) -> dict | None:
+    """Download and verify a GIF once; Telegram will fetch it from this bot's proxy."""
+    global GIF_CACHE_SIZE
+
+    source_url = item["gif_url"]
+    key = hashlib.sha256(source_url.encode("utf-8")).hexdigest()[:32]
+    if key in GIF_CACHE:
+        GIF_CACHE.move_to_end(key)
+        cached = dict(item)
+        cached["proxy_key"] = key
+        cached["gif_url"] = f"{WEBHOOK_BASE}/gif/{key}.gif"
+        cached["thumb_url"] = cached["gif_url"]
+        return cached
+
     try:
         async with client.stream(
             "GET",
-            url,
+            source_url,
             headers={
-                "Range": "bytes=0-15",
-                "User-Agent": "Mozilla/5.0 (compatible; TelegramGifSearchBot/1.0)",
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+                "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
             },
         ) as response:
-            if response.status_code not in (200, 206):
-                return False
+            response.raise_for_status()
             content_type = response.headers.get("content-type", "").lower()
-            first_bytes = b""
+            if content_type.startswith(("text/", "application/json")):
+                return None
+
+            body = bytearray()
             async for chunk in response.aiter_bytes():
-                first_bytes += chunk
-                if len(first_bytes) >= 6:
-                    break
-            # GIF87a and GIF89a are the file signatures. MIME alone is not trusted.
-            # The byte signature is authoritative; some CDNs mislabel MIME types.
-            return first_bytes[:6] in (b"GIF87a", b"GIF89a")
-    except Exception:
-        return False
+                body.extend(chunk)
+                if len(body) > MAX_GIF_BYTES:
+                    return None
+
+            data = bytes(body)
+            if data[:6] not in (b"GIF87a", b"GIF89a"):
+                return None
+
+        # Keep a bounded in-memory cache so the Render instance is not exhausted.
+        while GIF_CACHE and GIF_CACHE_SIZE + len(data) > MAX_CACHE_BYTES:
+            _, old_data = GIF_CACHE.popitem(last=False)
+            GIF_CACHE_SIZE -= len(old_data)
+        if len(data) > MAX_CACHE_BYTES:
+            return None
+
+        GIF_CACHE[key] = data
+        GIF_CACHE_SIZE += len(data)
+
+        verified = dict(item)
+        verified["proxy_key"] = key
+        verified["gif_url"] = f"{WEBHOOK_BASE}/gif/{key}.gif"
+        # Use our own proxy for the preview too; many original hosts block Telegram.
+        verified["thumb_url"] = verified["gif_url"]
+        return verified
+    except Exception as exc:
+        log.debug("Could not retrieve candidate GIF %s: %s", source_url, exc)
+        return None
 
 
 async def keep_real_gifs(items: list[dict], limit: int = 25) -> list[dict]:
-    """Filter dead URLs, HTML pages, thumbnails, and static images before Telegram sees them."""
-    timeout = httpx.Timeout(6.0, connect=4.0)
-    limits = httpx.Limits(max_connections=12, max_keepalive_connections=6)
+    """Fetch real GIF bytes and expose them through this bot's HTTPS Render URL."""
+    if not WEBHOOK_BASE.startswith("https://"):
+        log.error("WEBHOOK_BASE is not configured; cannot create GIF proxy URLs")
+        return []
+
+    timeout = httpx.Timeout(10.0, connect=5.0)
+    limits = httpx.Limits(max_connections=8, max_keepalive_connections=4)
     async with httpx.AsyncClient(
         timeout=timeout, follow_redirects=True, limits=limits
     ) as client:
-        semaphore = asyncio.Semaphore(10)
+        semaphore = asyncio.Semaphore(6)
 
-        async def check(item: dict) -> tuple[dict, bool]:
+        async def fetch(item: dict) -> dict | None:
             async with semaphore:
-                return item, await _is_real_gif(client, item["gif_url"])
+                return await _download_gif(client, item)
 
-        checked = await asyncio.gather(*(check(item) for item in items))
-    return [item for item, valid in checked if valid][:limit]
+        # Fetch a manageable candidate batch; failed hosts are skipped.
+        checked = await asyncio.gather(*(fetch(item) for item in items[:35]))
+    return [item for item in checked if item is not None][:limit]
+
+
+async def gif_proxy(request: web.Request) -> web.Response:
+    key = request.match_info["key"].removesuffix(".gif")
+    data = GIF_CACHE.get(key)
+    if data is None:
+        return web.Response(status=404, text="GIF expired; search again.")
+    GIF_CACHE.move_to_end(key)
+    return web.Response(
+        body=data,
+        content_type="image/gif",
+        headers={
+            "Cache-Control": "public, max-age=3600",
+            "Access-Control-Allow-Origin": "*",
+            "Content-Disposition": 'inline; filename="result.gif"',
+        },
+    )
 
 
 def search_ddg(query: str, limit: int = 25) -> list[dict]:
@@ -189,13 +247,6 @@ async def search_all(query: str, limit: int = 35) -> list[dict]:
     # despite the GIF filter. Only pass real GIF files to Telegram.
     return await keep_real_gifs(unique, limit=limit)
 
-
-def _dimension(value: Any) -> int | None:
-    try:
-        number = int(value)
-        return number if 1 <= number <= 10000 else None
-    except (TypeError, ValueError):
-        return None
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -379,6 +430,7 @@ async def run() -> None:
     web_app["telegram_application"] = application
     web_app.router.add_get("/", health)
     web_app.router.add_get("/health", health)
+    web_app.router.add_get("/gif/{key}", gif_proxy)
     web_app.router.add_post(webhook_path, telegram_webhook)
 
     runner = web.AppRunner(web_app)
