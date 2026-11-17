@@ -1,6 +1,5 @@
 import asyncio
 import hashlib
-from io import BytesIO
 import logging
 import os
 import re
@@ -10,7 +9,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
-from PIL import Image
+from ddgs import DDGS
+
 
 from redgifs.aio import API as RedGifsAPI
 from telegram import (
@@ -44,10 +44,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "redgifs-hook").strip("/")
 PORT = int(os.getenv("PORT", "10000"))
-ADULTEMBED_API = "https://adultembed.com/api/database/browse/"
-ADULTEMBED_PLAYER = "https://adultembed.com/player/embed/{}/"
 
 MAX_UPLOAD_BYTES = 49 * 1024 * 1024
+MAX_GIF_BYTES = 15 * 1024 * 1024
+DDG_RESULTS_PER_SEARCH = 5
 # Smaller first pages reduce the wait before Telegram can show results.
 RESULTS_PER_PAGE = 5
 INLINE_RESULTS_PER_PAGE = 5
@@ -180,7 +180,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Inline search: @YourBotUsername cats\n"
         "• Download: send a RedGIFs watch/ifr link\n"
         "• Help: /help\n\n"
-        "RedGIFs videos can be sent into Telegram; AdultEmbed results open in an external player. "
+        "Sources: RedGIFs video search and DuckDuckGo animated-GIF image search. "
         "This bot does not bypass access controls or age restrictions. "
         "18+ only.",
         reply_markup=age_keyboard(),
@@ -193,13 +193,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.effective_message.reply_text(
         "Commands:\n"
-        "/source — choose RedGIFs or AdultEmbed\n"
+        "/source — choose RedGIFs or DuckDuckGo GIFs\n"
         "/search keyword — search the selected source\n"
         "Inline: @YourBotUsername keyword (RedGIFs)\n"
         "/help — show this help\n\n"
         "To download, send a link such as:\n"
         "https://www.redgifs.com/watch/VIDEOID\n\n"
-        "AdultEmbed results show a thumbnail and a Watch button that opens its player.\n\n"
+        "Use /search in a group. To let the bot detect ordinary links in groups, "
+        "DuckDuckGo searches animated GIFs with Safe Search Off and sends valid GIF files.\n\n"
         "Use /search in a group. To let the bot detect ordinary links in groups, "
         "disable Group Privacy for the bot in @BotFather and re-add the bot."
     )
@@ -275,8 +276,8 @@ async def show_search_page(
 
 def source_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("RedGIFs · Telegram downloads", callback_data="source:redgifs")],
-        [InlineKeyboardButton("AdultEmbed · external player", callback_data="source:adultembed")],
+        [InlineKeyboardButton("RedGIFs · video search + downloads", callback_data="source:redgifs")],
+        [InlineKeyboardButton("DuckDuckGo · animated GIFs", callback_data="source:duckduckgo")],
     ])
 
 
@@ -284,101 +285,94 @@ async def source_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_age(update, context):
         return
     choice = " ".join(context.args).strip().lower()
-    if choice in {"redgifs", "adultembed"}:
+    aliases = {"ddg": "duckduckgo", "duckduckgo": "duckduckgo", "redgifs": "redgifs"}
+    if choice in aliases:
+        choice = aliases[choice]
         context.user_data["search_source"] = choice
-        label = "RedGIFs (video downloads and inline search)" if choice == "redgifs" else "AdultEmbed (thumbnails and external player)"
+        label = "DuckDuckGo animated GIFs" if choice == "duckduckgo" else "RedGIFs videos"
         await update.effective_message.reply_text(f"Search source set to {label}. Use /search keywords.")
         return
     current = context.user_data.get("search_source", "redgifs")
     await update.effective_message.reply_text(
-        f"Current source: {current}. Choose a search source:",
-        reply_markup=source_keyboard(),
+        f"Current source: {current}. Choose a source:", reply_markup=source_keyboard()
     )
 
 
-async def search_adultembed(query: str, page: int):
-    """Search AdultEmbed's documented public browse endpoint."""
-    params = {"search": query, "page": page, "page_size": RESULTS_PER_PAGE, "orientation": "all"}
-    timeout = httpx.Timeout(15.0, connect=7.0)
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        response = await client.get(ADULTEMBED_API, params=params)
-        response.raise_for_status()
-        payload = response.json()
-    if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
-        raise RuntimeError("AdultEmbed returned an unexpected response format.")
-    return payload
+async def search_duckduckgo_gifs(query: str, page: int = 1):
+    """Search DDG's animated-image filter with Safe Search explicitly off."""
+    def do_search():
+        with DDGS(timeout=12) as ddgs:
+            return list(ddgs.images(
+                query=query,
+                region="wt-wt",
+                safesearch="off",
+                type_image="gif",
+                max_results=DDG_RESULTS_PER_SEARCH,
+                page=page,
+                backend="duckduckgo",
+            ))
+    return await asyncio.wait_for(asyncio.to_thread(do_search), timeout=18)
 
 
-def safe_adultembed_thumbnail(url):
-    if not isinstance(url, str):
-        return None
+async def download_verified_gif(url: str) -> bytes:
     parsed = urlparse(url)
-    host = (parsed.hostname or "").lower()
-    if parsed.scheme != "https" or not (host == "adultembed.com" or host.endswith(".adultembed.com")):
-        return None
-    return url
-
-
-async def fetch_adultembed_thumbnail(url):
-    """Fetch a trusted AdultEmbed WebP thumbnail and convert it to Telegram JPEG."""
-    timeout = httpx.Timeout(12.0, connect=6.0)
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise ValueError("GIF result did not use a secure HTTPS URL")
+    timeout = httpx.Timeout(12.0, connect=5.0)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        response = await client.get(url)
-        response.raise_for_status()
-    if len(response.content) > 5 * 1024 * 1024:
-        raise RuntimeError("Thumbnail is unexpectedly large.")
-    with Image.open(BytesIO(response.content)) as image:
-        image = image.convert("RGB")
-        image.thumbnail((1280, 1280))
-        output = BytesIO()
-        image.save(output, format="JPEG", quality=88, optimize=True)
-        output.seek(0)
-        return output
+        async with client.stream("GET", url, headers={"User-Agent": "Mozilla/5.0 RetrixBot/1.0"}) as response:
+            response.raise_for_status()
+            final = urlparse(str(response.url))
+            if final.scheme != "https" or not final.hostname:
+                raise ValueError("GIF download redirected to an invalid URL")
+            content_type = response.headers.get("content-type", "").lower()
+            if "image/gif" not in content_type:
+                raise ValueError("Result is not served as an animated GIF")
+            chunks = []
+            total = 0
+            async for chunk in response.aiter_bytes():
+                total += len(chunk)
+                if total > MAX_GIF_BYTES:
+                    raise ValueError("GIF is larger than the 15 MB bot limit")
+                chunks.append(chunk)
+    data = b"".join(chunks)
+    if not (data.startswith(b"GIF87a") or data.startswith(b"GIF89a")):
+        raise ValueError("Downloaded file is not a valid GIF")
+    return data
 
 
-async def show_adultembed_page(query: str, page: int, chat, context):
-    payload = await search_adultembed(query, page)
-    results = payload.get("results", [])[:RESULTS_PER_PAGE]
-    if not results:
-        await chat.send_message(f"No AdultEmbed results found for: {query}")
-        return
-
-    context.user_data["search_query"] = query
-    context.user_data["search_page"] = page
-    context.user_data["search_source"] = "adultembed"
-
+async def send_duckduckgo_results(chat, query: str, page: int = 1):
+    results = await search_duckduckgo_gifs(query, page)
     sent = 0
+    skipped = 0
     for item in results:
-        video_id = item.get("id")
-        title = str(item.get("title") or "Untitled video").strip()
-        duration = str(item.get("duration") or "Duration unavailable").strip()
-        if not isinstance(video_id, (int, str)) or not str(video_id).isdigit():
+        gif_url = item.get("image")
+        if not isinstance(gif_url, str):
+            skipped += 1
             continue
-        player_url = ADULTEMBED_PLAYER.format(video_id)
-        thumbnail = safe_adultembed_thumbnail(item.get("thumbnail"))
-        caption = f"{title[:700]}\nDuration: {duration}\nAdultEmbed"
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("▶ Watch video", url=player_url)]])
         try:
-            if thumbnail:
-                photo = await fetch_adultembed_thumbnail(thumbnail)
-                await chat.send_photo(photo=InputFile(photo, filename="adultembed-thumb.jpg"), caption=caption[:1024], reply_markup=keyboard)
-            else:
-                await chat.send_message(f"{caption}\n{player_url}", reply_markup=keyboard)
+            data = await download_verified_gif(gif_url)
+            title = str(item.get("title") or query).strip()
+            source_url = str(item.get("url") or "").strip()
+            caption = f"DuckDuckGo GIF · {title}"
+            if source_url.startswith("https://"):
+                caption += f"\n{source_url}"
+            await chat.send_animation(
+                animation=InputFile(__import__("io").BytesIO(data), filename="result.gif"),
+                caption=caption[:1024],
+                read_timeout=30, write_timeout=30, connect_timeout=15, pool_timeout=20,
+            )
             sent += 1
-        except Exception:
-            log.exception("Could not send AdultEmbed thumbnail; sending text fallback")
-            await chat.send_message(f"{caption}\n{player_url}", reply_markup=keyboard)
-            sent += 1
-
-    has_next = bool(payload.get("next"))
-    has_previous = bool(payload.get("previous")) or page > 1
-    nav = []
-    if has_previous:
-        nav.append(InlineKeyboardButton("◀ Previous", callback_data=f"ae_page:{page-1}"))
-    if has_next:
-        nav.append(InlineKeyboardButton("Next ▶", callback_data=f"ae_page:{page+1}"))
-    text = f"AdultEmbed search: {query} · Page {page} · {sent} results\nChoose Watch to open the external player."
-    await chat.send_message(text, reply_markup=InlineKeyboardMarkup([nav]) if nav else None)
+        except Exception as exc:
+            skipped += 1
+            log.info("Skipping DDG result that could not be sent: %s", exc)
+    if sent == 0:
+        await chat.send_message(
+            f"DuckDuckGo found no directly downloadable GIF files for: {query}. "
+            "Some image results are previews or block direct downloads. Try another keyword."
+        )
+    else:
+        await chat.send_message(f"Sent {sent} animated GIF(s) for: {query}" + (f" · skipped {skipped}" if skipped else ""))
 
 
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -397,20 +391,20 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     source = context.user_data.get("search_source", "redgifs")
     status = await update.effective_message.reply_text(
-        "Searching AdultEmbed…" if source == "adultembed" else "Searching RedGIFs…"
+        "Searching DuckDuckGo for animated GIFs…" if source == "duckduckgo" else "Searching RedGIFs…"
     )
     try:
-        if source == "adultembed":
-            await show_adultembed_page(query, 1, update.effective_chat, context)
+        if source == "duckduckgo":
             await status.delete()
+            await send_duckduckgo_results(update.effective_chat, query, 1)
         else:
             await show_search_page(query, 1, update, context, edit_message=status)
     except Exception:
-        log.exception("Search failed (source=%s)", source)
-        await status.edit_text(
-            f"Search failed. {source} may be temporarily unavailable; please try again later."
-        )
-
+        log.exception("%s search failed", source)
+        try:
+            await status.edit_text("Search failed or timed out. Please try again in a moment.")
+        except Exception:
+            await update.effective_message.reply_text("Search failed or timed out. Please try again in a moment.")
 
 async def inline_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Return silent MP4 animation previews in Telegram's inline GIF-style grid."""
@@ -616,24 +610,12 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("source:"):
         selected = data.split(":", 1)[1]
-        if selected not in {"redgifs", "adultembed"}:
+        if selected not in {"redgifs", "duckduckgo"}:
+            await query.edit_message_text("Unknown source. Use /source to choose again.")
             return
         context.user_data["search_source"] = selected
-        label = "RedGIFs (Telegram downloads + inline search)" if selected == "redgifs" else "AdultEmbed (thumbnails + external player)"
+        label = "DuckDuckGo animated GIFs (Safe Search Off)" if selected == "duckduckgo" else "RedGIFs videos and downloads"
         await query.edit_message_text(f"Search source set to {label}. Use /search keywords.")
-        return
-
-    if data.startswith("ae_page:"):
-        try:
-            page = max(1, int(data.split(":", 1)[1]))
-            search_query = context.user_data.get("search_query")
-            if not search_query:
-                await query.edit_message_text("Please start a new search with /search keywords.")
-                return
-            await show_adultembed_page(search_query, page, query.message.chat, context)
-        except Exception:
-            log.exception("AdultEmbed pagination failed")
-            await query.message.reply_text("Couldn't load that AdultEmbed page. Please try /search again.")
         return
 
     if data.startswith("page:"):
