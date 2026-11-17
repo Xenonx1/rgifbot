@@ -2,13 +2,10 @@ import asyncio
 import hashlib
 import logging
 import os
-from collections import OrderedDict
 from typing import Any
-from urllib.parse import urlparse
 
-import httpx
-from aiohttp import web
 from ddgs import DDGS
+from aiohttp import web
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -24,413 +21,240 @@ from telegram.ext import (
 )
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "").strip()
-GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID", "").strip()
-WEBHOOK_BASE = os.getenv("WEBHOOK_URL", os.getenv("RENDER_EXTERNAL_URL", "")).rstrip("/")
 PORT = int(os.getenv("PORT", "10000"))
+RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+SEARCH_LIMIT = 40
 PAGE_SIZE = 10
-INLINE_PAGE_SIZE = 25
-SEARCH_TIMEOUT = 18
-MAX_GIF_BYTES = 8 * 1024 * 1024
-MAX_CACHE_BYTES = 64 * 1024 * 1024
-GIF_CACHE: OrderedDict[str, bytes] = OrderedDict()
-GIF_CACHE_SIZE = 0
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-log = logging.getLogger("gifbot")
+log = logging.getLogger("ddg-gif-bot")
 
 
-def _valid_http_url(value: Any) -> bool:
-    if not isinstance(value, str) or len(value) > 4000:
-        return False
-    parsed = urlparse(value)
-    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
-
-
-
-async def _download_gif(client: httpx.AsyncClient, item: dict) -> dict | None:
-    """Download and verify a GIF once; Telegram will fetch it from this bot's proxy."""
-    global GIF_CACHE_SIZE
-
-    source_url = item["gif_url"]
-    key = hashlib.sha256(source_url.encode("utf-8")).hexdigest()[:32]
-    if key in GIF_CACHE:
-        GIF_CACHE.move_to_end(key)
-        cached = dict(item)
-        cached["proxy_key"] = key
-        cached["gif_url"] = f"{WEBHOOK_BASE}/gif/{key}.gif"
-        cached["thumb_url"] = cached["gif_url"]
-        return cached
-
-    try:
-        async with client.stream(
-            "GET",
-            source_url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-                "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-            },
-        ) as response:
-            response.raise_for_status()
-            content_type = response.headers.get("content-type", "").lower()
-            if content_type.startswith(("text/", "application/json")):
-                return None
-
-            body = bytearray()
-            async for chunk in response.aiter_bytes():
-                body.extend(chunk)
-                if len(body) > MAX_GIF_BYTES:
-                    return None
-
-            data = bytes(body)
-            if data[:6] not in (b"GIF87a", b"GIF89a"):
-                return None
-
-        # Keep a bounded in-memory cache so the Render instance is not exhausted.
-        while GIF_CACHE and GIF_CACHE_SIZE + len(data) > MAX_CACHE_BYTES:
-            _, old_data = GIF_CACHE.popitem(last=False)
-            GIF_CACHE_SIZE -= len(old_data)
-        if len(data) > MAX_CACHE_BYTES:
-            return None
-
-        GIF_CACHE[key] = data
-        GIF_CACHE_SIZE += len(data)
-
-        verified = dict(item)
-        verified["proxy_key"] = key
-        verified["gif_url"] = f"{WEBHOOK_BASE}/gif/{key}.gif"
-        # Use our own proxy for the preview too; many original hosts block Telegram.
-        verified["thumb_url"] = verified["gif_url"]
-        return verified
-    except Exception as exc:
-        log.debug("Could not retrieve candidate GIF %s: %s", source_url, exc)
-        return None
-
-
-async def keep_real_gifs(items: list[dict], limit: int = 25) -> list[dict]:
-    """Fetch real GIF bytes and expose them through this bot's HTTPS Render URL."""
-    if not WEBHOOK_BASE.startswith("https://"):
-        log.error("WEBHOOK_BASE is not configured; cannot create GIF proxy URLs")
-        return []
-
-    timeout = httpx.Timeout(10.0, connect=5.0)
-    limits = httpx.Limits(max_connections=8, max_keepalive_connections=4)
-    async with httpx.AsyncClient(
-        timeout=timeout, follow_redirects=True, limits=limits
-    ) as client:
-        semaphore = asyncio.Semaphore(6)
-
-        async def fetch(item: dict) -> dict | None:
-            async with semaphore:
-                return await _download_gif(client, item)
-
-        # Fetch a manageable candidate batch; failed hosts are skipped.
-        checked = await asyncio.gather(*(fetch(item) for item in items[:35]))
-    return [item for item in checked if item is not None][:limit]
-
-
-async def gif_proxy(request: web.Request) -> web.Response:
-    key = request.match_info["key"].removesuffix(".gif")
-    data = GIF_CACHE.get(key)
-    if data is None:
-        return web.Response(status=404, text="GIF expired; search again.")
-    GIF_CACHE.move_to_end(key)
-    return web.Response(
-        body=data,
-        content_type="image/gif",
-        headers={
-            "Cache-Control": "public, max-age=3600",
-            "Access-Control-Allow-Origin": "*",
-            "Content-Disposition": 'inline; filename="result.gif"',
-        },
+def is_http_url(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and value.startswith(("https://", "http://"))
+        and len(value) < 4000
     )
 
 
-def search_ddg(query: str, limit: int = 25) -> list[dict]:
-    """DuckDuckGo image search. Provider results are not guaranteed to stay stable."""
-    found = []
+def search_duckduckgo(query: str, limit: int = SEARCH_LIMIT) -> list[dict]:
+    """Search DuckDuckGo Images for GIF format, with SafeSearch disabled."""
+    results = []
+    seen = set()
+
     try:
-        with DDGS(timeout=SEARCH_TIMEOUT) as ddgs:
-            rows = ddgs.images(
+        with DDGS(timeout=15) as ddgs:
+            items = ddgs.images(
                 query,
                 region="wt-wt",
                 safesearch="off",
                 type_image="gif",
                 max_results=limit,
             )
-            for row in rows:
-                image_url = row.get("image")
-                thumb = row.get("thumbnail") or image_url
-                if _valid_http_url(image_url):
-                    found.append({
-                        "gif_url": image_url,
-                        "thumb_url": thumb if _valid_http_url(thumb) else image_url,
-                        "title": (row.get("title") or "GIF")[:180],
-                        "width": row.get("width"),
-                        "height": row.get("height"),
-                        "source": "DuckDuckGo",
-                    })
-    except Exception:
-        log.exception("DuckDuckGo search failed")
-    return found
 
+            for item in items:
+                gif_url = item.get("image")
+                thumbnail_url = item.get("thumbnail") or gif_url
 
-async def search_google(query: str, limit: int = 10) -> list[dict]:
-    """Google Custom Search JSON API. Requires a configured API key and CSE ID."""
-    if not GOOGLE_API_KEY or not GOOGLE_CSE_ID:
-        return []
+                if not is_http_url(gif_url) or gif_url in seen:
+                    continue
 
-    params = {
-        "key": GOOGLE_API_KEY,
-        "cx": GOOGLE_CSE_ID,
-        "q": query,
-        "searchType": "image",
-        "fileType": "gif",
-        "safe": "off",
-        "num": min(limit, 10),
-    }
-    try:
-        async with httpx.AsyncClient(timeout=SEARCH_TIMEOUT, follow_redirects=True) as client:
-            response = await client.get(
-                "https://www.googleapis.com/customsearch/v1",
-                params=params,
-            )
-            response.raise_for_status()
-            payload = response.json()
-
-        found = []
-        for row in payload.get("items", []):
-            image_url = row.get("link")
-            image_info = row.get("image") or {}
-            thumb = image_info.get("thumbnailLink") or image_url
-            if _valid_http_url(image_url):
-                found.append({
-                    "gif_url": image_url,
-                    "thumb_url": thumb if _valid_http_url(thumb) else image_url,
-                    "title": (row.get("title") or "GIF")[:180],
-                    "width": image_info.get("width"),
-                    "height": image_info.get("height"),
-                    "source": "Google",
+                seen.add(gif_url)
+                results.append({
+                    "gif_url": gif_url,
+                    "thumbnail_url": thumbnail_url if is_http_url(thumbnail_url) else gif_url,
+                    "title": (item.get("title") or "GIF")[:100],
                 })
-        return found
+
+                if len(results) >= limit:
+                    break
+
     except Exception:
-        log.exception("Google image search failed")
-        return []
+        log.exception("DuckDuckGo image search failed")
+
+    return results
 
 
-async def search_all(query: str, limit: int = 35) -> list[dict]:
-    ddg_task = asyncio.to_thread(search_ddg, query, 25)
-    google_task = search_google(query, 10)
-    ddg_rows, google_rows = await asyncio.gather(ddg_task, google_task)
-
-    # Mix the providers so one provider does not dominate the first screen.
-    combined = []
-    for index in range(max(len(google_rows), len(ddg_rows))):
-        if index < len(google_rows):
-            combined.append(google_rows[index])
-        if index < len(ddg_rows):
-            combined.append(ddg_rows[index])
-
-    unique, seen = [], set()
-    for item in combined:
-        url = item["gif_url"]
-        if url in seen:
-            continue
-        seen.add(url)
-        unique.append(item)
-        if len(unique) >= limit:
-            break
-    # Search providers sometimes return a static thumbnail or an HTML page
-    # despite the GIF filter. Only pass real GIF files to Telegram.
-    return await keep_real_gifs(unique, limit=limit)
-
+async def get_results(query: str) -> list[dict]:
+    return await asyncio.to_thread(search_duckduckgo, query, SEARCH_LIMIT)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
-        "Hi! I can search animated GIFs.\n\n"
-        "Private search: /search your keywords\n"
-        "Inline search: type @YourBotUsername your keywords in any chat.\n\n"
-        "Enable inline mode for this bot through @BotFather first."
+        "DuckDuckGo GIF Search Bot\n\n"
+        "Private search: /search cats\n"
+        "Inline search: type @YourBotUsername cats in any Telegram chat.\n\n"
+        "Only DuckDuckGo is used. Image search requests GIF format and SafeSearch off."
     )
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await start(update, context)
 
 
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = " ".join(context.args).strip()
     if not query:
-        await update.effective_message.reply_text(
-            "Use: /search funny cats\n"
-            "Or type @YourBotUsername funny cats in any Telegram chat."
-        )
+        await update.effective_message.reply_text("Usage: /search cats")
         return
 
-    status = await update.effective_message.reply_text("Searching DuckDuckGo and Google…")
-    results = await search_all(query, limit=50)
-    context.user_data["gif_search"] = {"query": query, "results": results}
+    status = await update.effective_message.reply_text("Searching DuckDuckGo for GIFs…")
+    results = await get_results(query)
+    context.user_data["ddg_results"] = {"query": query, "items": results}
 
     if not results:
         await status.edit_text(
-            "No directly accessible animated GIF files were found. Try different keywords. "
-            "Some search results are static previews or block Telegram access. "
-            "Google results also require a valid Google API key and Search Engine ID."
+            "DuckDuckGo returned no GIF results for that search. Try different keywords."
         )
         return
 
-    await show_private_page(status, context, page=0)
+    await show_page(status, context, 0)
 
 
-async def show_private_page(message, context: ContextTypes.DEFAULT_TYPE, page: int) -> None:
-    state = context.user_data.get("gif_search") or {}
-    results = state.get("results", [])
+async def show_page(message, context: ContextTypes.DEFAULT_TYPE, page: int) -> None:
+    state = context.user_data.get("ddg_results", {})
+    items = state.get("items", [])
     query = state.get("query", "")
-    total_pages = max(1, (len(results) + PAGE_SIZE - 1) // PAGE_SIZE)
-    page = max(0, min(page, total_pages - 1))
-    state["page"] = page
+    pages = max(1, (len(items) + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
 
-    start_index = page * PAGE_SIZE
-    current = results[start_index:start_index + PAGE_SIZE]
-    rows = []
-    for local_index, item in enumerate(current):
-        absolute_index = start_index + local_index
-        title = item.get("title") or f"GIF {absolute_index + 1}"
-        label = f"{absolute_index + 1}. {title[:32]}"
-        rows.append([InlineKeyboardButton(label, callback_data=f"gif:{absolute_index}")])
+    first = page * PAGE_SIZE
+    current = items[first:first + PAGE_SIZE]
+    keyboard = []
+
+    for offset, item in enumerate(current):
+        index = first + offset
+        title = item.get("title") or f"GIF {index + 1}"
+        keyboard.append([
+            InlineKeyboardButton(
+                f"{index + 1}. {title[:35]}",
+                callback_data=f"send:{index}",
+            )
+        ])
 
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("‹ Previous", callback_data=f"page:{page-1}"))
-    if page + 1 < total_pages:
-        nav.append(InlineKeyboardButton("Next ›", callback_data=f"page:{page+1}"))
+        nav.append(InlineKeyboardButton("‹ Previous", callback_data=f"page:{page - 1}"))
+    if page + 1 < pages:
+        nav.append(InlineKeyboardButton("Next ›", callback_data=f"page:{page + 1}"))
     if nav:
-        rows.append(nav)
+        keyboard.append(nav)
 
-    text = (
-        f"GIF results for: {query}\n"
-        f"Showing {start_index + 1}–{start_index + len(current)} of {len(results)}.\n"
-        "Tap a result to send that GIF."
+    await message.edit_text(
+        f"DuckDuckGo GIF results for: {query}\n"
+        f"Showing {first + 1}–{first + len(current)} of {len(items)}.\n"
+        "Tap a result to send it.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
-    await message.edit_text(text, reply_markup=InlineKeyboardMarkup(rows))
 
 
-async def private_result_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    data = query.data or ""
+async def result_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    callback = update.callback_query
+    await callback.answer()
+    data = callback.data or ""
 
     if data.startswith("page:"):
         try:
-            page = int(data.split(":", 1)[1])
-            await show_private_page(query.message, context, page)
+            await show_page(callback.message, context, int(data.split(":", 1)[1]))
         except (ValueError, AttributeError):
-            await query.answer("That page is no longer available.", show_alert=True)
+            await callback.answer("Page unavailable. Search again.", show_alert=True)
         return
 
-    if data.startswith("gif:"):
+    if data.startswith("send:"):
         try:
             index = int(data.split(":", 1)[1])
-            results = context.user_data.get("gif_search", {}).get("results", [])
-            item = results[index]
+            item = context.user_data["ddg_results"]["items"][index]
         except (ValueError, IndexError, KeyError):
-            await query.answer("That result is no longer available. Search again.", show_alert=True)
+            await callback.answer("Result unavailable. Search again.", show_alert=True)
             return
 
         try:
+            # Pass the original DuckDuckGo image URL to Telegram unchanged.
             await context.bot.send_animation(
-                chat_id=query.message.chat_id,
+                chat_id=callback.message.chat_id,
                 animation=item["gif_url"],
-                caption=(item.get("title") or "GIF")[:900],
+                caption=item.get("title", "GIF")[:900],
             )
         except Exception:
-            log.exception("Telegram could not fetch/send selected GIF")
-            await query.answer(
-                "Telegram couldn't load this GIF from its source. Try another result.",
+            log.exception("Telegram could not send selected GIF URL")
+            await callback.answer(
+                "Telegram could not load this source URL. Try another result.",
                 show_alert=True,
             )
 
 
-async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query_text = (update.inline_query.query or "").strip()
-    if not query_text:
-        await update.inline_query.answer(
-            [],
-            cache_time=2,
-            switch_pm_text="Search GIFs",
-            switch_pm_parameter="search",
-        )
+async def inline_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = (update.inline_query.query or "").strip()
+
+    if not query:
+        await update.inline_query.answer([], cache_time=2)
         return
 
-    try:
-        results = await search_all(query_text, limit=35)
-        inline_results = []
-        for item in results[:50]:
-            kwargs = {
-                "id": hashlib.sha256(item["gif_url"].encode()).hexdigest()[:32],
-                "gif_url": item["gif_url"],
-                "thumbnail_url": item["thumb_url"],
-                "title": (item.get("title") or "GIF")[:60],
-            }
-            # Deliberately omit provider width/height: incorrect dimensions can
-            # make Telegram's inline preview render with a broken aspect ratio.
-            inline_results.append(InlineQueryResultGif(**kwargs))
+    items = await get_results(query)
+    results = []
 
-        await update.inline_query.answer(
-            inline_results,
-            cache_time=15,
-            is_personal=True,
+    for item in items[:50]:
+        # Use the search result image URL and thumbnail URL directly.
+        # No proxy, conversion, rehosting, or extra filtering is applied.
+        result_id = hashlib.sha256(item["gif_url"].encode()).hexdigest()[:32]
+        results.append(
+            InlineQueryResultGif(
+                id=result_id,
+                gif_url=item["gif_url"],
+                thumbnail_url=item["thumbnail_url"],
+                title=item["title"][:60],
+            )
         )
-    except Exception:
-        log.exception("Inline query handler failed")
-        await update.inline_query.answer([], cache_time=1)
+
+    await update.inline_query.answer(
+        results,
+        cache_time=10,
+        is_personal=True,
+    )
 
 
 async def health(request: web.Request) -> web.Response:
-    return web.json_response({"status": "ok", "service": "telegram-gif-search-bot"})
+    return web.json_response({"status": "ok", "bot": "duckduckgo-gif-search"})
 
 
 async def telegram_webhook(request: web.Request) -> web.Response:
-    application: Application = request.app["telegram_application"]
+    app: Application = request.app["telegram_app"]
     try:
         payload = await request.json()
-        update = Update.de_json(payload, application.bot)
-        await application.process_update(update)
+        update = Update.de_json(payload, app.bot)
+        await app.process_update(update)
         return web.Response(text="ok")
     except Exception:
-        log.exception("Webhook update processing failed")
+        log.exception("Could not process Telegram webhook update")
         return web.Response(status=500, text="error")
 
 
-async def run() -> None:
-    if not WEBHOOK_BASE.startswith("https://"):
+async def main() -> None:
+    if not RENDER_URL.startswith("https://"):
         raise RuntimeError(
-            "Set WEBHOOK_URL to your deployed Render URL, e.g. https://your-service.onrender.com"
+            "Render did not provide RENDER_EXTERNAL_URL. Deploy this as a Render Web Service."
         )
 
-    application = Application.builder().token(BOT_TOKEN).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("search", search_command))
-    application.add_handler(CallbackQueryHandler(private_result_callback, pattern=r"^(gif|page):"))
-    application.add_handler(InlineQueryHandler(inline_query_handler))
+    telegram_app = Application.builder().token(BOT_TOKEN).build()
+    telegram_app.add_handler(CommandHandler("start", start))
+    telegram_app.add_handler(CommandHandler("help", start))
+    telegram_app.add_handler(CommandHandler("search", search_command))
+    telegram_app.add_handler(
+        CallbackQueryHandler(result_callback, pattern=r"^(send|page):")
+    )
+    telegram_app.add_handler(InlineQueryHandler(inline_search))
 
-    secret_path = hashlib.sha256(BOT_TOKEN.encode()).hexdigest()[:32]
-    webhook_path = f"/telegram/{secret_path}"
-    webhook_url = f"{WEBHOOK_BASE}{webhook_path}"
+    # A private webhook path avoids exposing the bot token in the URL.
+    secret = hashlib.sha256(BOT_TOKEN.encode()).hexdigest()[:32]
+    webhook_path = f"/telegram/{secret}"
 
-    await application.initialize()
-    await application.start()
+    await telegram_app.initialize()
+    await telegram_app.start()
 
     web_app = web.Application()
-    web_app["telegram_application"] = application
+    web_app["telegram_app"] = telegram_app
     web_app.router.add_get("/", health)
     web_app.router.add_get("/health", health)
-    web_app.router.add_get("/gif/{key}", gif_proxy)
     web_app.router.add_post(webhook_path, telegram_webhook)
 
     runner = web.AppRunner(web_app)
@@ -438,21 +262,22 @@ async def run() -> None:
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
 
-    await application.bot.set_webhook(
-        url=webhook_url,
+    await telegram_app.bot.set_webhook(
+        url=f"{RENDER_URL}{webhook_path}",
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
     )
-    log.info("GIF search bot is running. Webhook: %s", webhook_url)
+
+    log.info("DuckDuckGo GIF bot started; webhook configured.")
 
     try:
         await asyncio.Event().wait()
     finally:
-        await application.bot.delete_webhook()
+        await telegram_app.bot.delete_webhook()
         await runner.cleanup()
-        await application.stop()
-        await application.shutdown()
+        await telegram_app.stop()
+        await telegram_app.shutdown()
 
 
 if __name__ == "__main__":
-    asyncio.run(run())
+    asyncio.run(main())
