@@ -42,7 +42,7 @@ def is_http_url(value: Any) -> bool:
 
 
 def search_duckduckgo(query: str, limit: int = SEARCH_LIMIT) -> list[dict]:
-    """Search DuckDuckGo Images for GIF format, with SafeSearch disabled."""
+    """Search DuckDuckGo only; trust its GIF type filter and preserve source URLs."""
     results = []
     seen = set()
 
@@ -53,7 +53,8 @@ def search_duckduckgo(query: str, limit: int = SEARCH_LIMIT) -> list[dict]:
                 region="wt-wt",
                 safesearch="off",
                 type_image="gif",
-                max_results=limit,
+                backend="duckduckgo",
+                max_results=limit * 3,
             )
 
             for item in items:
@@ -62,14 +63,13 @@ def search_duckduckgo(query: str, limit: int = SEARCH_LIMIT) -> list[dict]:
 
                 if not is_http_url(gif_url) or gif_url in seen:
                     continue
-
                 seen.add(gif_url)
+
                 results.append({
                     "gif_url": gif_url,
                     "thumbnail_url": thumbnail_url if is_http_url(thumbnail_url) else gif_url,
                     "title": (item.get("title") or "GIF")[:100],
                 })
-
                 if len(results) >= limit:
                     break
 
