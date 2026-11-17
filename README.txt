@@ -1,59 +1,37 @@
-DUCKDUCKGO-ONLY TELEGRAM GIF BOT
+DUCKDUCKGO-ONLY TELEGRAM GIF BOT — RENDER COMPATIBILITY FIX
 
-Features
+This revision changes the search dependency stack to avoid the malformed-headers failure seen in the Render logs.
+
+SEARCH SETTINGS
 - DuckDuckGo Images only.
-- Requests GIF image format (type_image="gif").
-- SafeSearch parameter is set to "off".
-- Uses the original image and thumbnail URLs directly in Telegram inline results.
-- No Google API, no proxy, no rehosting, no GIF conversion.
-- Inline search: @YourBotUsername cats
-- Private search: /search cats
+- safesearch="off".
+- type_image="gif".
+- Original image and thumbnail URLs are passed directly to Telegram.
+- No Google API, proxy, rehosting, conversion, or pre-download verification.
 
-RENDER DEPLOYMENT
-1. Create a GitHub repository and upload main.py, requirements.txt, render.yaml.
-2. In Render choose New + > Blueprint and connect the repository.
-3. Render asks for BOT_TOKEN. Enter the token from @BotFather.
-4. Deploy. Render supplies RENDER_EXTERNAL_URL automatically.
-5. Build command: pip install -r requirements.txt
-6. Start command: python main.py
-7. Health check path: /health
+DEPENDENCIES / RUNTIME
+- Python 3.12.10 (selected by .python-version)
+- duckduckgo-search 8.1.1
+- primp 1.3.1 (pinned to avoid an unbounded newer transport dependency)
+
+RENDER
+- Build command: pip install -r requirements.txt
+- Start command: python main.py
+- Health check: /health
+- Required environment variable: BOT_TOKEN
+- Render automatically supplies PORT and RENDER_EXTERNAL_URL.
+- No Google API key, Google CSE ID, or WEBHOOK_URL.
+
+DEPLOY
+1. Replace the files in the GitHub repository with all files in this ZIP, including the hidden .python-version file.
+2. Commit and push the changes.
+3. In Render, use Manual Deploy > Clear build cache & deploy (important so old dependencies are not reused).
+4. Confirm the build log installs duckduckgo-search==8.1.1 and primp==1.3.1.
+5. Keep the start command as python main.py.
+6. Test /search cats in a private chat first, then test @YourBotUsername cats inline.
 
 TELEGRAM INLINE MODE
-1. Open @BotFather.
-2. Send /setinline.
-3. Select this bot.
-4. Set a placeholder such as "Search GIFs".
-5. In any chat type @YourBotUsername followed by search words.
+If inline mode has not already been enabled: open @BotFather, send /setinline, select the bot, and set a placeholder such as Search GIFs.
 
-ENVIRONMENT VARIABLES
-Required:
-BOT_TOKEN = token copied from @BotFather
-
-Automatically supplied by Render:
-RENDER_EXTERNAL_URL
-PORT
-
-Optional:
-LOG_LEVEL = INFO (set DEBUG when diagnosing)
-
-No Google API key, Google CSE ID, or WEBHOOK_URL is required.
-
-IMPORTANT
-The bot passes DuckDuckGo's original image URLs directly to Telegram. DuckDuckGo's GIF filter and SafeSearch-off setting are search parameters, not a guarantee that every result is a playable GIF or that every host permits Telegram to fetch it. If a source URL is blocked or is not a direct GIF file, Telegram may show a blank preview or fail to send it. This implementation intentionally does not proxy, download, transform, or replace the original media.
-
-
-STRICT SEARCH SETTINGS
-- Search backend is forced to DuckDuckGo only (not auto/Bing).
-- SafeSearch is explicitly set to off.
-- DuckDuckGo image type is explicitly set to gif.
-- Each candidate URL is fetched and checked for a real multi-frame GIF before it is shown.
-- This strict verification can reduce the number of results because some hosts block automated requests or do not serve the original GIF directly.
-
-Render environment variables:
-Required: BOT_TOKEN
-Automatic on Render: RENDER_EXTERNAL_URL, PORT
-Optional: LOG_LEVEL (INFO or DEBUG)
-No Google API key or search engine ID is needed.
-
-IMPORTANT PREVIEW NOTE:
-This version does not download or reject source URLs before sending them to Telegram. It trusts DuckDuckGo's GIF image-type filter and passes the original image and thumbnail URLs directly to Telegram. Telegram can still show a blank preview when a source host blocks Telegram or the returned URL is not a directly playable GIF.
+NOTE
+The library asks DuckDuckGo for GIF image results with SafeSearch off. Search engines and source hosts can still return inaccurate file labels or block Telegram's media fetch, so a blank preview can still occur for an individual source URL. This fix addresses the DuckDuckGo request error in the supplied Render log; it cannot guarantee every source host is Telegram-compatible.

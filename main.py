@@ -4,7 +4,7 @@ import logging
 import os
 from typing import Any
 
-from ddgs import DDGS
+from duckduckgo_search import DDGS
 from aiohttp import web
 from telegram import (
     InlineKeyboardButton,
@@ -53,7 +53,6 @@ def search_duckduckgo(query: str, limit: int = SEARCH_LIMIT) -> list[dict]:
                 region="wt-wt",
                 safesearch="off",
                 type_image="gif",
-                backend="duckduckgo",
                 max_results=limit * 3,
             )
 
@@ -88,7 +87,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "DuckDuckGo GIF Search Bot\n\n"
         "Private search: /search cats\n"
         "Inline search: type @YourBotUsername cats in any Telegram chat.\n\n"
-        "Only DuckDuckGo is used. Image search requests GIF format and SafeSearch off."
+        "DuckDuckGo only. GIF image filter requested; SafeSearch is off."
     )
 
 
